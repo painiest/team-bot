@@ -1,0 +1,21 @@
+{
+  "name": "team-management-bot",
+  "version": "1.0.0",
+  "description": "Telegram Bot for team management with ideas and karma system",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js",
+    "dev": "nodemon index.js"
+  },
+  "dependencies": {
+    "telegraf": "^4.16.3",
+    "sqlite3": "^5.1.7",
+    "dotenv": "^16.4.5"
+  },
+  "devDependencies": {
+    "nodemon": "^3.1.4"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}
