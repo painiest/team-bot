@@ -1,5 +1,5 @@
 require('dotenv').config();
-const { Telegraf, Markup, session } = require('telegraf');
+const { Telegraf, Markup, session, Scenes } = require('telegraf');
 const Database = require('./database');
 
 const BOT_TOKEN = process.env.BOT_TOKEN;
@@ -63,92 +63,94 @@ bot.command('ideas', async (ctx) => {
     }
 });
 
-// Idea conversation
-bot.command('idea', async (ctx) => {
-    ctx.session.idea = {};
+// Idea conversation steps
+const ideaTitleHandler = async (ctx) => {
+    ctx.session.idea = ctx.session.idea || {};
+    ctx.session.idea.title = ctx.message.text;
+    await ctx.reply('خوبه! حالا یک توضیح کوتاه برای ایده ات بنویس:');
+    return ctx.wizard.next();
+};
+
+const ideaDescriptionHandler = async (ctx) => {
+    ctx.session.idea.description = ctx.message.text;
+    
+    const keyboard = Markup.keyboard([
+        ['کم', 'متوسط', 'زیاد']
+    ]).oneTime().resize();
+    
     await ctx.reply(
-        'عالی! می‌خوای یک ایده جدید ثبت کنی.\nلطفاً عنوان ایده رو وارد کن:',
-        Markup.removeKeyboard()
+        'اولویت ایده رو انتخاب کن:',
+        keyboard
     );
     return ctx.wizard.next();
-});
+};
 
-// Wizard steps for idea creation
-const ideaWizard = {
-    title: async (ctx) => {
-        ctx.session.idea.title = ctx.message.text;
-        await ctx.reply('خوبه! حالا یک توضیح کوتاه برای ایده ات بنویس:');
-        return ctx.wizard.next();
-    },
-    description: async (ctx) => {
-        ctx.session.idea.description = ctx.message.text;
-        
-        const keyboard = Markup.keyboard([
-            ['کم', 'متوسط', 'زیاد']
-        ]).oneTime().resize();
+const ideaPriorityHandler = async (ctx) => {
+    if (!['کم', 'متوسط', 'زیاد'].includes(ctx.message.text)) {
+        await ctx.reply('لطفاً یکی از گزینه‌های موجود را انتخاب کنید:');
+        return;
+    }
+    
+    ctx.session.idea.priority = ctx.message.text;
+    
+    try {
+        await db.createIdea(
+            ctx.session.idea.title,
+            ctx.session.idea.description,
+            ctx.from.id,
+            ctx.session.idea.priority
+        );
         
         await ctx.reply(
-            'اولویت ایده رو انتخاب کن:',
-            keyboard
+            'ایده تو با موفقیت ثبت شد! 🎉\n10 امتیاز کارما گرفتی!',
+            Markup.removeKeyboard()
         );
-        return ctx.wizard.next();
-    },
-    priority: async (ctx) => {
-        if (!['کم', 'متوسط', 'زیاد'].includes(ctx.message.text)) {
-            await ctx.reply('لطفاً یکی از گزینه‌های موجود را انتخاب کنید:');
-            return;
-        }
         
-        ctx.session.idea.priority = ctx.message.text;
-        
-        try {
-            await db.createIdea(
-                ctx.session.idea.title,
-                ctx.session.idea.description,
-                ctx.from.id,
-                ctx.session.idea.priority
-            );
-            
-            await ctx.reply(
-                'ایده تو با موفقیت ثبت شد! 🎉\n10 امتیاز کارما گرفتی!',
-                Markup.removeKeyboard()
-            );
-            
-            // Send notification to group
-            const user = ctx.from;
-            const groupMessage = `
+        // Send notification to group
+        const user = ctx.from;
+        const groupMessage = `
 ایده جدید ثبت شد! 💡
 
 عنوان: ${ctx.session.idea.title}
 توضیحات: ${ctx.session.idea.description}
 اولویت: ${ctx.session.idea.priority}
 ثبت شده توسط: @${user.username || user.first_name}
-            `.trim();
-            
-            await bot.telegram.sendMessage(GROUP_CHAT_ID, groupMessage);
-            
-        } catch (error) {
-            console.error('Error creating idea:', error);
-            await ctx.reply('خطایی در ثبت ایده رخ داده است.');
-        }
+        `.trim();
         
-        delete ctx.session.idea;
-        return ctx.scene.leave();
+        await bot.telegram.sendMessage(GROUP_CHAT_ID, groupMessage);
+        
+    } catch (error) {
+        console.error('Error creating idea:', error);
+        await ctx.reply('خطایی در ثبت ایده رخ داده است.');
     }
+    
+    delete ctx.session.idea;
+    return ctx.scene.leave();
 };
 
-// Setup wizard
-const { Scenes: { WizardScene } } = require('telegraf');
-const ideaScene = new WizardScene(
-    'ideaScene',
-    ideaWizard.title,
-    ideaWizard.description,
-    ideaWizard.priority
+// Create wizard scene
+const ideaWizard = new Scenes.WizardScene(
+    'ideaWizard',
+    async (ctx) => {
+        await ctx.reply(
+            'عالی! می‌خوای یک ایده جدید ثبت کنی.\nلطفاً عنوان ایده رو وارد کن:',
+            Markup.removeKeyboard()
+        );
+        return ctx.wizard.next();
+    },
+    ideaTitleHandler,
+    ideaDescriptionHandler,
+    ideaPriorityHandler
 );
 
-const { Stage } = require('telegraf');
-const stage = new Stage([ideaScene]);
+// Create stage and register scene
+const stage = new Scenes.Stage([ideaWizard]);
 bot.use(stage.middleware());
+
+// Idea command to start the wizard
+bot.command('idea', (ctx) => {
+    ctx.scene.enter('ideaWizard');
+});
 
 // Cancel command
 bot.command('cancel', async (ctx) => {
