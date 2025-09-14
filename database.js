@@ -770,6 +770,15 @@ class Database {
         });
     }
 
+    getUser(userId) {
+        return new Promise((resolve, reject) => {
+            this.db.get('SELECT * FROM users WHERE user_id = ?', [userId], (err, row) => {
+                if (err) reject(err);
+                else resolve(row);
+            });
+        });
+    }
+
     searchContent(query, type = 'all') {
         return new Promise((resolve, reject) => {
             let sql = '';

@@ -320,7 +320,15 @@ bot.use(stage.middleware());
 
 // START COMMAND
 bot.start(async (ctx) => {
-    const welcomeMessage = `
+    // ابتدا کاربر رو ایجاد یا آپدیت کن
+    await db.createUser(ctx.from.id, ctx.from.username || ctx.from.first_name);
+    
+    // بررسی کن آیا کاربر قبلاً قوانین رو پذیرفته
+    const user = await db.getUser(ctx.from.id);
+    
+    if (user && user.accepted_rules) {
+        // کاربر قبلاً قوانین رو پذیرفته
+        const welcomeMessage = `
 سلام ${ctx.from.first_name}! 👋
 به ربات مدیریت تیم خوش اومدی!
 
@@ -336,12 +344,26 @@ bot.start(async (ctx) => {
 👥 /members - مدیریت اعضا (ادمین)
 
 برای شروع /help رو بزن.
-    `.trim();
+        `.trim();
 
-    await ctx.reply(welcomeMessage);
+        await ctx.reply(welcomeMessage);
+    } else {
+        // کاربر هنوز قوانین رو نپذیرفته
+        const welcomeMessage = `
+سلام ${ctx.from.first_name}! 👋
+به ربات مدیریت تیم خوش اومدی!
 
-    // Send rules and ask for acceptance
-    const rulesMessage = `
+📝 /idea - ثبت ایده جدید
+💡 /ideas - مشاهده ایده‌ها
+🏆 /karma - امتیاز من
+🎯 /task - ساخت تسک جدید
+📋 /mytasks - تسک‌های من
+        `.trim();
+
+        await ctx.reply(welcomeMessage);
+
+        // Send rules and ask for acceptance
+        const rulesMessage = `
 📋 قوانین تیم:
 
 1. احترام متقابل به همه اعضا
@@ -350,12 +372,13 @@ bot.start(async (ctx) => {
 4. مشارکت در بحث‌های تیمی
 
 آیا قوانین رو می‌پذیری؟
-    `.trim();
+        `.trim();
 
-    await ctx.reply(rulesMessage, Markup.inlineKeyboard([
-        Markup.button.callback('✅ قبول می‌کنم', 'accept_rules'),
-        Markup.button.callback('❌ نمی‌پذیرم', 'reject_rules')
-    ]));
+        await ctx.reply(rulesMessage, Markup.inlineKeyboard([
+            Markup.button.callback('✅ قبول می‌کنم', 'accept_rules'),
+            Markup.button.callback('❌ نمی‌پذیرم', 'reject_rules')
+        ]));
+    }
 });
 
 // HELP COMMAND
@@ -696,16 +719,24 @@ app.use(express.json());
 app.get('/', (req, res) => res.send('ربات تلگرام در حال اجراست!'));
 
 // Webhook setup for Render
+let isWebhookSetup = false;
+
 app.listen(PORT, async () => {
     console.log(`سرور در پورت ${PORT} در حال اجراست`);
     
     // Set webhook in production
     if (process.env.NODE_ENV === 'production') {
-        const domain = process.env.RENDER_EXTERNAL_URL;
-        await bot.telegram.setWebhook(`${domain}/bot${BOT_TOKEN}`);
-        app.post(`/bot${BOT_TOKEN}`, (req, res) => {
-            bot.handleUpdate(req.body, res);
-        });
+        try {
+            const domain = process.env.RENDER_EXTERNAL_URL;
+            await bot.telegram.setWebhook(`${domain}/bot${BOT_TOKEN}`);
+            app.post(`/bot${BOT_TOKEN}`, (req, res) => {
+                bot.handleUpdate(req.body, res);
+            });
+            isWebhookSetup = true;
+            console.log('Webhook setup successfully');
+        } catch (error) {
+            console.error('Error setting webhook:', error);
+        }
     }
 });
 
@@ -716,6 +747,24 @@ if (process.env.NODE_ENV !== 'production') {
     });
 }
 
-// Graceful stop
-process.once('SIGINT', () => bot.stop('SIGINT'));
-process.once('SIGTERM', () => bot.stop('SIGTERM'));
+// Graceful stop - فقط در حالت polling
+if (process.env.NODE_ENV !== 'production') {
+    process.once('SIGINT', () => bot.stop('SIGINT'));
+    process.once('SIGTERM', () => bot.stop('SIGTERM'));
+} else {
+    // در حالت production فقط webhook رو حذف کنیم
+    process.once('SIGINT', async () => {
+        if (isWebhookSetup) {
+            await bot.telegram.deleteWebhook();
+            console.log('Webhook deleted');
+        }
+        process.exit(0);
+    });
+    process.once('SIGTERM', async () => {
+        if (isWebhookSetup) {
+            await bot.telegram.deleteWebhook();
+            console.log('Webhook deleted');
+        }
+        process.exit(0);
+    });
+}
