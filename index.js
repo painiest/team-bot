@@ -177,6 +177,18 @@ bot.launch().then(() => {
     console.log('ربات در حال اجراست...');
 });
 
+const express = require('express');
+const app = express();
+const PORT = process.env.PORT || 3000;
+
+app.get('/', (req, res) => {
+  res.send('ربات تلگرام در حال اجراست!');
+});
+
+app.listen(PORT, () => {
+  console.log(`سرور در پورت ${PORT} در حال اجراست`);
+});
+
 // Enable graceful stop
 process.once('SIGINT', () => bot.stop('SIGINT'));
 process.once('SIGTERM', () => bot.stop('SIGTERM'));
