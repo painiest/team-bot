@@ -12,28 +12,22 @@ class Database {
         });
     }
 
-    initTables() {
-        const usersTable = `
-            CREATE TABLE IF NOT EXISTS users (
+    async initTables() {
+        const tables = [
+            `CREATE TABLE IF NOT EXISTS users (
                 user_id INTEGER PRIMARY KEY,
                 username TEXT,
                 karma INTEGER DEFAULT 0
-            )
-        `;
-
-        const ideasTable = `
-            CREATE TABLE IF NOT EXISTS ideas (
+            )`,
+            `CREATE TABLE IF NOT EXISTS ideas (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 title TEXT NOT NULL,
                 description TEXT,
                 author_id INTEGER NOT NULL,
                 priority TEXT DEFAULT 'medium',
                 created_at DATETIME DEFAULT CURRENT_TIMESTAMP
-            )
-        `;
-
-        const tasksTable = `
-            CREATE TABLE IF NOT EXISTS tasks (
+            )`,
+            `CREATE TABLE IF NOT EXISTS tasks (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 title TEXT NOT NULL,
                 description TEXT,
@@ -41,14 +35,19 @@ class Database {
                 deadline TEXT,
                 status TEXT DEFAULT 'ToDo',
                 creator_id INTEGER NOT NULL,
-                created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-                FOREIGN KEY (creator_id) REFERENCES users (user_id)
-            )
-        `;
+                created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+            )`
+        ];
 
-        this.db.run(usersTable);
-        this.db.run(ideasTable);
-        this.db.run(tasksTable);
+        for (const sql of tables) {
+            await new Promise((resolve, reject) => {
+                this.db.run(sql, (err) => {
+                    if (err) reject(err);
+                    else resolve();
+                });
+            });
+        }
+        console.log('Tables initialized');
     }
 
     getUser(userId) {
@@ -60,44 +59,99 @@ class Database {
         });
     }
 
-    createUser(userId, username) {
+    createUser(userId, username = '') {  // Fallback to empty string
         return new Promise((resolve, reject) => {
-            this.getUser(userId).then(user => {
-                if (!user) {
-                    this.db.run(
-                        'INSERT INTO users (user_id, username) VALUES (?, ?)',
-                        [userId, username],
-                        function(err) {
-                            if (err) reject(err);
-                            else resolve(this.lastID);
-                        }
-                    );
-                } else {
-                    resolve(null);
+            // Idempotent: INSERT OR IGNORE to avoid UNIQUE violation
+            this.db.run(
+                'INSERT OR IGNORE INTO users (user_id, username) VALUES (?, ?)',
+                [userId, username],
+                function(err) {
+                    if (err) reject(err);
+                    else resolve(this.changes > 0 ? this.lastID : null);  // 1 if inserted, 0 if ignored
                 }
-            }).catch(reject);
+            );
         });
     }
 
     createIdea(title, description, authorId, priority = 'medium') {
         return new Promise((resolve, reject) => {
-            this.db.run(
-                'INSERT INTO ideas (title, description, author_id, priority) VALUES (?, ?, ?, ?)',
-                [title, description, authorId, priority],
-                function(err) {
-                    if (err) return reject(err);
-                    
-                    // Add karma to user
-                    this.db.run(
-                        'UPDATE users SET karma = karma + 10 WHERE user_id = ?',
-                        [authorId],
-                        (err) => {
-                            if (err) reject(err);
-                            else resolve(this.lastID);
-                        }
-                    );
-                }.bind(this)
-            );
+            this.db.serialize(() => {  // Transaction-like
+                this.db.run(
+                    'BEGIN TRANSACTION',
+                    (err) => {
+                        if (err) return reject(err);
+                        this.db.run(
+                            'INSERT INTO ideas (title, description, author_id, priority) VALUES (?, ?, ?, ?)',
+                            [title, description, authorId, priority],
+                            function(err) {
+                                if (err) {
+                                    this.db.run('ROLLBACK');
+                                    return reject(err);
+                                }
+                                // Add karma only if user exists
+                                this.db.get('SELECT user_id FROM users WHERE user_id = ?', [authorId], (err, user) => {
+                                    if (err) {
+                                        this.db.run('ROLLBACK');
+                                        reject(err);
+                                    } else if (user) {
+                                        this.db.run(
+                                            'UPDATE users SET karma = karma + 10 WHERE user_id = ?',
+                                            [authorId],
+                                            (err) => {
+                                                if (err) {
+                                                    this.db.run('ROLLBACK');
+                                                    reject(err);
+                                                } else {
+                                                    this.db.run('COMMIT', () => resolve(this.lastID));
+                                                }
+                                            }
+                                        );
+                                    } else {
+                                        this.db.run('ROLLBACK');
+                                        reject(new Error('User not found for karma update'));
+                                    }
+                                });
+                            }.bind(this)
+                        );
+                    }
+                );
+            });
+        });
+    }
+
+    createTask(title, description, assignee, deadline, status, creatorId) {
+        return new Promise((resolve, reject) => {
+            this.db.serialize(() => {
+                this.db.run(
+                    'BEGIN TRANSACTION',
+                    (err) => {
+                        if (err) return reject(err);
+                        this.db.run(
+                            'INSERT INTO tasks (title, description, assignee_username, deadline, status, creator_id) VALUES (?, ?, ?, ?, ?, ?)',
+                            [title, description, assignee, deadline, status, creatorId],
+                            function(err) {
+                                if (err) {
+                                    this.db.run('ROLLBACK');
+                                    return reject(err);
+                                }
+                                // Add karma to creator
+                                this.db.run(
+                                    'UPDATE users SET karma = karma + 5 WHERE user_id = ?',
+                                    [creatorId],
+                                    (err) => {
+                                        if (err) {
+                                            this.db.run('ROLLBACK');
+                                            reject(err);
+                                        } else {
+                                            this.db.run('COMMIT', () => resolve(this.lastID));
+                                        }
+                                    }
+                                );
+                            }.bind(this)
+                        );
+                    }
+                );
+            });
         });
     }
 
@@ -117,7 +171,7 @@ class Database {
     getAllIdeas() {
         return new Promise((resolve, reject) => {
             this.db.all(
-                `SELECT ideas.*, users.username 
+                `SELECT ideas.*, COALESCE(users.username, 'ناشناس') as username 
                  FROM ideas 
                  LEFT JOIN users ON ideas.author_id = users.user_id 
                  ORDER BY ideas.created_at DESC`,
@@ -138,24 +192,11 @@ class Database {
         });
     }
 
-    createTask(title, description, assignee, deadline, status, creatorId) {
-        return new Promise((resolve, reject) => {
-            this.db.run(
-                'INSERT INTO tasks (title, description, assignee_username, deadline, status, creator_id) VALUES (?, ?, ?, ?, ?, ?)',
-                [title, description, assignee, deadline, status, creatorId],
-                function(err) {
-                    if (err) reject(err);
-                    else resolve(this.lastID);
-                }.bind(this)
-            );
-        });
-    }
-
     getUserTasks(userId) {
         return new Promise((resolve, reject) => {
             this.db.all(
                 `SELECT * FROM tasks 
-                 WHERE assignee_username = (SELECT username FROM users WHERE user_id = ?) 
+                 WHERE assignee_username = COALESCE((SELECT username FROM users WHERE user_id = ?), '') 
                  ORDER BY created_at DESC`,
                 [userId],
                 (err, rows) => {
