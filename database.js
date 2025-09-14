@@ -1,25 +1,32 @@
+// database.js
+// بازنویسی‌شده — اصلاح مدیریت تراکنش‌ها، PRAGMA، و سازگاری با sqlite
 const sqlite3 = require('sqlite3').verbose();
+const path = require('path');
 
 class Database {
-    constructor(dbPath = 'team_bot.db') {
-        this.db = new sqlite3.Database(dbPath, (err) => {
+    constructor(dbPath = path.join(__dirname, 'team_bot.db')) {
+        this.dbPath = dbPath;
+        this.db = new sqlite3.Database(this.dbPath, (err) => {
             if (err) {
                 console.error('Error opening database:', err);
             } else {
-                console.log('Connected to SQLite database');
-                this.initTables();
-                this.enableForeignKeys();
+                console.log('Connected to SQLite database:', this.dbPath);
+                // حتماً PRAGMA رو قبل از ایجاد جداول ست کن
+                this.db.serialize(() => {
+                    this.db.run("PRAGMA foreign_keys = ON");
+                    // WAL improves concurrency (optional)
+                    this.db.run("PRAGMA journal_mode = WAL");
+                    this.initTables().catch(e => {
+                        console.error('initTables error:', e);
+                    });
+                });
             }
         });
     }
 
-    enableForeignKeys() {
-        this.db.run('PRAGMA foreign_keys = ON');
-    }
-
     async initTables() {
+        // توجه: SQLite نوع JSON نداره — از TEXT استفاده می‌کنیم و JSON.stringify/parse می‌کنیم
         const tables = [
-            // Users table
             `CREATE TABLE IF NOT EXISTS users (
                 user_id INTEGER PRIMARY KEY,
                 username TEXT,
@@ -27,10 +34,9 @@ class Database {
                 role TEXT DEFAULT 'member',
                 last_active DATETIME DEFAULT CURRENT_TIMESTAMP,
                 joined_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-                accepted_rules BOOLEAN DEFAULT FALSE
+                accepted_rules INTEGER DEFAULT 0
             )`,
 
-            // Ideas table
             `CREATE TABLE IF NOT EXISTS ideas (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 title TEXT NOT NULL,
@@ -43,24 +49,22 @@ class Database {
                 FOREIGN KEY (author_id) REFERENCES users (user_id) ON DELETE CASCADE
             )`,
 
-            // Tasks table (با assignee_id اضافه شده)
             `CREATE TABLE IF NOT EXISTS tasks (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 title TEXT NOT NULL,
                 description TEXT,
-                assignee_id INTEGER NOT NULL,
-                assignee_username TEXT NOT NULL,
+                assignee_id INTEGER,
+                assignee_username TEXT,
                 deadline TEXT,
                 status TEXT DEFAULT 'ToDo',
-                creator_id INTEGER NOT NULL,
+                creator_id INTEGER,
                 related_idea_id INTEGER,
                 created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-                FOREIGN KEY (assignee_id) REFERENCES users (user_id) ON DELETE CASCADE,
-                FOREIGN KEY (creator_id) REFERENCES users (user_id) ON DELETE CASCADE,
+                FOREIGN KEY (assignee_id) REFERENCES users (user_id) ON DELETE SET NULL,
+                FOREIGN KEY (creator_id) REFERENCES users (user_id) ON DELETE SET NULL,
                 FOREIGN KEY (related_idea_id) REFERENCES ideas (id) ON DELETE SET NULL
             )`,
 
-            // Standups table
             `CREATE TABLE IF NOT EXISTS standups (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 user_id INTEGER NOT NULL,
@@ -73,7 +77,6 @@ class Database {
                 UNIQUE(user_id, date)
             )`,
 
-            // Files table
             `CREATE TABLE IF NOT EXISTS files (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 uploader_id INTEGER NOT NULL,
@@ -84,18 +87,16 @@ class Database {
                 FOREIGN KEY (uploader_id) REFERENCES users (user_id) ON DELETE CASCADE
             )`,
 
-            // Polls table
             `CREATE TABLE IF NOT EXISTS polls (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 title TEXT NOT NULL,
-                options JSON NOT NULL,
-                votes JSON DEFAULT '{}',
+                options TEXT NOT NULL, -- JSON stored as TEXT
+                votes TEXT DEFAULT '{}' , -- JSON stored as TEXT
                 created_by INTEGER NOT NULL,
                 created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
                 FOREIGN KEY (created_by) REFERENCES users (user_id) ON DELETE CASCADE
             )`,
 
-            // Idea Votes table
             `CREATE TABLE IF NOT EXISTS idea_votes (
                 user_id INTEGER NOT NULL,
                 idea_id INTEGER NOT NULL,
@@ -105,20 +106,18 @@ class Database {
                 FOREIGN KEY (idea_id) REFERENCES ideas (id) ON DELETE CASCADE
             )`,
 
-            // Roles table
             `CREATE TABLE IF NOT EXISTS roles (
                 user_id INTEGER PRIMARY KEY,
                 role TEXT NOT NULL DEFAULT 'member',
                 FOREIGN KEY (user_id) REFERENCES users (user_id) ON DELETE CASCADE
             )`,
 
-            // Notifications table
             `CREATE TABLE IF NOT EXISTS notifications (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 user_id INTEGER NOT NULL,
                 message TEXT NOT NULL,
                 type TEXT NOT NULL,
-                is_read BOOLEAN DEFAULT FALSE,
+                is_read INTEGER DEFAULT 0,
                 created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
                 FOREIGN KEY (user_id) REFERENCES users (user_id) ON DELETE CASCADE
             )`
@@ -132,503 +131,423 @@ class Database {
                 });
             });
         }
+
         console.log('All tables initialized successfully');
     }
 
-    // ============ USER METHODS ============
-    getUser(userId) {
+    // ---------- Utility: run/get/all as promises ----------
+    run(sql, params = []) {
+        const db = this.db;
         return new Promise((resolve, reject) => {
-            this.db.get('SELECT * FROM users WHERE user_id = ?', [userId], (err, row) => {
+            db.run(sql, params, function (err) {
+                if (err) reject(err);
+                else resolve({ changes: this.changes, lastID: this.lastID });
+            });
+        });
+    }
+
+    get(sql, params = []) {
+        const db = this.db;
+        return new Promise((resolve, reject) => {
+            db.get(sql, params, (err, row) => {
                 if (err) reject(err);
                 else resolve(row);
             });
         });
     }
 
-    createUser(userId, username = '') {
+    all(sql, params = []) {
+        const db = this.db;
         return new Promise((resolve, reject) => {
-            this.db.run(
-                'INSERT OR IGNORE INTO users (user_id, username) VALUES (?, ?)',
-                [userId, username],
-                function(err) {
-                    if (err) reject(err);
-                    else resolve(this.changes > 0);
-                }
-            );
+            db.all(sql, params, (err, rows) => {
+                if (err) reject(err);
+                else resolve(rows);
+            });
         });
     }
 
-    updateUserLastActive(userId) {
-        return new Promise((resolve, reject) => {
-            this.db.run(
-                'UPDATE users SET last_active = CURRENT_TIMESTAMP WHERE user_id = ?',
-                [userId],
-                (err) => {
-                    if (err) reject(err);
-                    else resolve();
-                }
-            );
-        });
+    // ============ USER METHODS ============
+    async getUser(userId) {
+        return await this.get('SELECT * FROM users WHERE user_id = ?', [userId]);
     }
 
-    acceptRules(userId) {
-        return new Promise((resolve, reject) => {
-            this.db.run(
-                'UPDATE users SET accepted_rules = TRUE WHERE user_id = ?',
-                [userId],
-                (err) => {
-                    if (err) reject(err);
-                    else resolve();
-                }
-            );
-        });
+    async createUser(userId, username = '') {
+        const res = await this.run(
+            'INSERT OR IGNORE INTO users (user_id, username) VALUES (?, ?)',
+            [userId, username]
+        );
+        return res.changes > 0;
+    }
+
+    async updateUserLastActive(userId) {
+        await this.run('UPDATE users SET last_active = CURRENT_TIMESTAMP WHERE user_id = ?', [userId]);
+    }
+
+    async acceptRules(userId) {
+        await this.run('UPDATE users SET accepted_rules = 1 WHERE user_id = ?', [userId]);
     }
 
     // ============ IDEA METHODS ============
     createIdea(title, description, authorId, priority = 'medium') {
+        const db = this.db;
         return new Promise((resolve, reject) => {
-            this.db.serialize(() => {
-                this.db.run('BEGIN TRANSACTION');
+            db.serialize(() => {
+                db.run('BEGIN TRANSACTION', (err) => {
+                    if (err) return reject(err);
 
-                this.db.run(
-                    'INSERT INTO ideas (title, description, author_id, priority) VALUES (?, ?, ?, ?)',
-                    [title, description, authorId, priority],
-                    function(err) {
-                        if (err) {
-                            this.db.run('ROLLBACK');
-                            return reject(err);
-                        }
-                        const ideaId = this.lastID;
+                    db.run(
+                        'INSERT INTO ideas (title, description, author_id, priority) VALUES (?, ?, ?, ?)',
+                        [title, description, authorId, priority],
+                        function (err) {
+                            if (err) {
+                                db.run('ROLLBACK', () => {});
+                                return reject(err);
+                            }
+                            const ideaId = this.lastID;
 
-                        // Add karma to author
-                        this.db.run(
-                            'UPDATE users SET karma = karma + 10 WHERE user_id = ?',
-                            [authorId],
-                            (err) => {
-                                if (err) {
-                                    this.db.run('ROLLBACK');
-                                    return reject(err);
-                                }
-
-                                this.db.run('COMMIT', (err) => {
+                            db.run(
+                                'UPDATE users SET karma = karma + 10 WHERE user_id = ?',
+                                [authorId],
+                                (err) => {
                                     if (err) {
-                                        this.db.run('ROLLBACK');
+                                        db.run('ROLLBACK', () => {});
                                         return reject(err);
                                     }
-                                    resolve(ideaId);
-                                });
-                            }
-                        );
-                    }.bind(this)
-                );
+
+                                    db.run('COMMIT', (err) => {
+                                        if (err) {
+                                            db.run('ROLLBACK', () => {});
+                                            return reject(err);
+                                        }
+                                        resolve(ideaId);
+                                    });
+                                }
+                            );
+                        }
+                    );
+                });
             });
         });
     }
 
     voteForIdea(userId, ideaId) {
+        const db = this.db;
         return new Promise((resolve, reject) => {
-            this.db.serialize(() => {
-                this.db.run('BEGIN TRANSACTION');
+            db.serialize(() => {
+                db.run('BEGIN TRANSACTION', (err) => {
+                    if (err) return reject(err);
 
-                // Check if already voted
-                this.db.get(
-                    'SELECT 1 FROM idea_votes WHERE user_id = ? AND idea_id = ?',
-                    [userId, ideaId],
-                    (err, row) => {
-                        if (err) {
-                            this.db.run('ROLLBACK');
-                            return reject(err);
-                        }
+                    db.get(
+                        'SELECT 1 FROM idea_votes WHERE user_id = ? AND idea_id = ?',
+                        [userId, ideaId],
+                        (err, row) => {
+                            if (err) {
+                                db.run('ROLLBACK', () => {});
+                                return reject(err);
+                            }
 
-                        if (row) {
-                            this.db.run('ROLLBACK');
-                            return resolve(false); // Already voted
-                        }
+                            if (row) {
+                                db.run('ROLLBACK', () => {});
+                                return resolve(false); // already voted
+                            }
 
-                        // Insert vote record
-                        this.db.run(
-                            'INSERT INTO idea_votes (user_id, idea_id) VALUES (?, ?)',
-                            [userId, ideaId],
-                            (err) => {
-                                if (err) {
-                                    this.db.run('ROLLBACK');
-                                    return reject(err);
-                                }
+                            db.run(
+                                'INSERT INTO idea_votes (user_id, idea_id) VALUES (?, ?)',
+                                [userId, ideaId],
+                                function (err) {
+                                    if (err) {
+                                        db.run('ROLLBACK', () => {});
+                                        return reject(err);
+                                    }
 
-                                // Update idea votes count
-                                this.db.run(
-                                    'UPDATE ideas SET votes = votes + 1 WHERE id = ?',
-                                    [ideaId],
-                                    (err) => {
-                                        if (err) {
-                                            this.db.run('ROLLBACK');
-                                            return reject(err);
-                                        }
-
-                                        this.db.run('COMMIT', (err) => {
+                                    db.run(
+                                        'UPDATE ideas SET votes = votes + 1 WHERE id = ?',
+                                        [ideaId],
+                                        (err) => {
                                             if (err) {
-                                                this.db.run('ROLLBACK');
+                                                db.run('ROLLBACK', () => {});
                                                 return reject(err);
                                             }
-                                            resolve(true);
-                                        });
-                                    }
-                                );
-                            }
-                        );
-                    }
-                );
+
+                                            db.run('COMMIT', (err) => {
+                                                if (err) {
+                                                    db.run('ROLLBACK', () => {});
+                                                    return reject(err);
+                                                }
+                                                resolve(true);
+                                            });
+                                        }
+                                    );
+                                }
+                            );
+                        }
+                    );
+                });
             });
         });
     }
 
     getAllIdeas(limit = 50, offset = 0) {
-        return new Promise((resolve, reject) => {
-            this.db.all(
-                `SELECT ideas.*, users.username, 
-                 (SELECT COUNT(*) FROM idea_votes WHERE idea_votes.idea_id = ideas.id) as vote_count
-                 FROM ideas 
-                 LEFT JOIN users ON ideas.author_id = users.user_id 
-                 ORDER BY ideas.created_at DESC 
-                 LIMIT ? OFFSET ?`,
-                [limit, offset],
-                (err, rows) => {
-                    if (err) reject(err);
-                    else resolve(rows);
-                }
-            );
-        });
+        const sql = `
+            SELECT ideas.*, users.username,
+            (SELECT COUNT(*) FROM idea_votes WHERE idea_votes.idea_id = ideas.id) as vote_count
+            FROM ideas
+            LEFT JOIN users ON ideas.author_id = users.user_id
+            ORDER BY ideas.created_at DESC
+            LIMIT ? OFFSET ?
+        `;
+        return this.all(sql, [limit, offset]);
     }
 
     // ============ TASK METHODS ============
     createTask(title, description, assigneeId, assigneeUsername, deadline, status, creatorId, relatedIdeaId = null) {
+        const db = this.db;
         return new Promise((resolve, reject) => {
-            this.db.serialize(() => {
-                this.db.run('BEGIN TRANSACTION');
+            db.serialize(() => {
+                db.run('BEGIN TRANSACTION', (err) => {
+                    if (err) return reject(err);
 
-                this.db.run(
-                    'INSERT INTO tasks (title, description, assignee_id, assignee_username, deadline, status, creator_id, related_idea_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
-                    [title, description, assigneeId, assigneeUsername, deadline, status, creatorId, relatedIdeaId],
-                    function(err) {
-                        if (err) {
-                            this.db.run('ROLLBACK');
-                            return reject(err);
-                        }
-                        const taskId = this.lastID;
+                    db.run(
+                        `INSERT INTO tasks 
+                         (title, description, assignee_id, assignee_username, deadline, status, creator_id, related_idea_id)
+                         VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+                        [title, description, assigneeId, assigneeUsername, deadline, status, creatorId, relatedIdeaId],
+                        function (err) {
+                            if (err) {
+                                db.run('ROLLBACK', () => {});
+                                return reject(err);
+                            }
+                            const taskId = this.lastID;
 
-                        // Add karma to creator
-                        this.db.run(
-                            'UPDATE users SET karma = karma + 5 WHERE user_id = ?',
-                            [creatorId],
-                            (err) => {
-                                if (err) {
-                                    this.db.run('ROLLBACK');
-                                    return reject(err);
-                                }
-
-                                this.db.run('COMMIT', (err) => {
+                            db.run(
+                                'UPDATE users SET karma = karma + 5 WHERE user_id = ?',
+                                [creatorId],
+                                (err) => {
                                     if (err) {
-                                        this.db.run('ROLLBACK');
+                                        db.run('ROLLBACK', () => {});
                                         return reject(err);
                                     }
-                                    resolve(taskId);
-                                });
-                            }
-                        );
-                    }.bind(this)
-                );
+
+                                    db.run('COMMIT', (err) => {
+                                        if (err) {
+                                            db.run('ROLLBACK', () => {});
+                                            return reject(err);
+                                        }
+                                        resolve(taskId);
+                                    });
+                                }
+                            );
+                        }
+                    );
+                });
             });
         });
     }
 
     updateTaskStatus(taskId, newStatus) {
+        const db = this.db;
         return new Promise((resolve, reject) => {
-            this.db.serialize(() => {
-                this.db.run('BEGIN TRANSACTION');
+            db.serialize(() => {
+                db.run('BEGIN TRANSACTION', (err) => {
+                    if (err) return reject(err);
 
-                this.db.run(
-                    'UPDATE tasks SET status = ? WHERE id = ?',
-                    [newStatus, taskId],
-                    function(err) {
+                    db.run('UPDATE tasks SET status = ? WHERE id = ?', [newStatus, taskId], function (err) {
                         if (err) {
-                            this.db.run('ROLLBACK');
+                            db.run('ROLLBACK', () => {});
                             return reject(err);
                         }
 
-                        // If task is marked as done, add karma to assignee
-                        if (newStatus.toLowerCase() === 'done') {
-                            this.db.get(
-                                'SELECT assignee_id FROM tasks WHERE id = ?',
-                                [taskId],
-                                (err, task) => {
-                                    if (err) {
-                                        this.db.run('ROLLBACK');
-                                        return reject(err);
-                                    }
+                        const changes = this.changes;
 
-                                    if (task && task.assignee_id) {
-                                        this.db.run(
-                                            'UPDATE users SET karma = karma + 30 WHERE user_id = ?',
-                                            [task.assignee_id],
-                                            (err) => {
-                                                if (err) {
-                                                    this.db.run('ROLLBACK');
-                                                    return reject(err);
-                                                }
-
-                                                this.db.run('COMMIT', (err) => {
-                                                    if (err) {
-                                                        this.db.run('ROLLBACK');
-                                                        return reject(err);
-                                                    }
-                                                    resolve(this.changes > 0);
-                                                });
-                                            }
-                                        );
-                                    } else {
-                                        this.db.run('COMMIT', (err) => {
-                                            if (err) {
-                                                this.db.run('ROLLBACK');
-                                                return reject(err);
-                                            }
-                                            resolve(this.changes > 0);
-                                        });
-                                    }
-                                }
-                            );
-                        } else {
-                            this.db.run('COMMIT', (err) => {
+                        if (String(newStatus).toLowerCase() === 'done') {
+                            db.get('SELECT assignee_id FROM tasks WHERE id = ?', [taskId], (err, task) => {
                                 if (err) {
-                                    this.db.run('ROLLBACK');
+                                    db.run('ROLLBACK', () => {});
                                     return reject(err);
                                 }
-                                resolve(this.changes > 0);
+
+                                if (task && task.assignee_id) {
+                                    db.run('UPDATE users SET karma = karma + 30 WHERE user_id = ?', [task.assignee_id], (err) => {
+                                        if (err) {
+                                            db.run('ROLLBACK', () => {});
+                                            return reject(err);
+                                        }
+
+                                        db.run('COMMIT', (err) => {
+                                            if (err) {
+                                                db.run('ROLLBACK', () => {});
+                                                return reject(err);
+                                            }
+                                            resolve(changes > 0);
+                                        });
+                                    });
+                                } else {
+                                    db.run('COMMIT', (err) => {
+                                        if (err) {
+                                            db.run('ROLLBACK', () => {});
+                                            return reject(err);
+                                        }
+                                        resolve(changes > 0);
+                                    });
+                                }
+                            });
+                        } else {
+                            db.run('COMMIT', (err) => {
+                                if (err) {
+                                    db.run('ROLLBACK', () => {});
+                                    return reject(err);
+                                }
+                                resolve(changes > 0);
                             });
                         }
-                    }.bind(this)
-                );
+                    });
+                });
             });
         });
     }
 
     getUserTasks(userId) {
-        return new Promise((resolve, reject) => {
-            this.db.all(
-                `SELECT tasks.*, 
-                 (SELECT username FROM users WHERE user_id = tasks.creator_id) as creator_username
-                 FROM tasks 
-                 WHERE assignee_id = ?
-                 ORDER BY created_at DESC`,
-                [userId],
-                (err, rows) => {
-                    if (err) reject(err);
-                    else resolve(rows);
-                }
-            );
-        });
+        const sql = `
+            SELECT tasks.*,
+            (SELECT username FROM users WHERE user_id = tasks.creator_id) as creator_username
+            FROM tasks
+            WHERE assignee_id = ?
+            ORDER BY created_at DESC
+        `;
+        return this.all(sql, [userId]);
     }
 
     getOverdueTasks() {
-        return new Promise((resolve, reject) => {
-            this.db.all(
-                `SELECT * FROM tasks 
-                 WHERE deadline < date('now') AND status NOT IN ('Done', 'Overdue')`,
-                (err, rows) => {
-                    if (err) reject(err);
-                    else resolve(rows);
-                }
-            );
-        });
+        return this.all(
+            `SELECT * FROM tasks 
+             WHERE deadline < date('now') AND status NOT IN ('Done', 'Overdue')`
+        );
     }
 
     // ============ STANDUP METHODS ============
     createStandup(userId, date, yesterday, today, blocker) {
-        return new Promise((resolve, reject) => {
-            this.db.run(
-                'INSERT OR REPLACE INTO standups (user_id, date, yesterday, today, blocker) VALUES (?, ?, ?, ?, ?)',
-                [userId, date, yesterday, today, blocker],
-                function(err) {
-                    if (err) reject(err);
-                    else resolve(this.changes > 0);
-                }
-            );
-        });
+        return this.run(
+            'INSERT OR REPLACE INTO standups (user_id, date, yesterday, today, blocker) VALUES (?, ?, ?, ?, ?)',
+            [userId, date, yesterday, today, blocker]
+        ).then(res => res.changes > 0);
     }
 
     getTodaysStandups() {
         const today = new Date().toISOString().split('T')[0];
-        return new Promise((resolve, reject) => {
-            this.db.all(
-                `SELECT standups.*, users.username 
-                 FROM standups 
-                 JOIN users ON standups.user_id = users.user_id 
-                 WHERE date = ?`,
-                [today],
-                (err, rows) => {
-                    if (err) reject(err);
-                    else resolve(rows);
-                }
-            );
-        });
+        const sql = `
+            SELECT standups.*, users.username
+            FROM standups
+            JOIN users ON standups.user_id = users.user_id
+            WHERE date = ?
+        `;
+        return this.all(sql, [today]);
     }
 
     getUsersWithoutStandup(days = 3) {
-        return new Promise((resolve, reject) => {
-            this.db.all(
-                `SELECT user_id, username 
-                 FROM users 
-                 WHERE user_id NOT IN (
-                     SELECT DISTINCT user_id 
-                     FROM standups 
-                     WHERE date >= date('now', ?)
-                 ) AND role != 'inactive'`,
-                [`-${days} days`],
-                (err, rows) => {
-                    if (err) reject(err);
-                    else resolve(rows);
-                }
-            );
-        });
+        const sql = `
+            SELECT user_id, username
+            FROM users
+            WHERE user_id NOT IN (
+                SELECT DISTINCT user_id FROM standups WHERE date >= date('now', ?)
+            ) AND role != 'inactive'
+        `;
+        return this.all(sql, [`-${days} days`]);
     }
 
     // ============ FILE METHODS ============
     saveFile(uploaderId, fileId, title = '', tags = '') {
-        return new Promise((resolve, reject) => {
-            this.db.run(
-                'INSERT INTO files (uploader_id, file_id_telegram, title, tags) VALUES (?, ?, ?, ?)',
-                [uploaderId, fileId, title, tags],
-                function(err) {
-                    if (err) reject(err);
-                    else resolve(this.lastID);
-                }
-            );
-        });
+        return this.run(
+            'INSERT INTO files (uploader_id, file_id_telegram, title, tags) VALUES (?, ?, ?, ?)',
+            [uploaderId, fileId, title, tags]
+        ).then(res => res.lastID);
     }
 
     getFilesByTag(tag, limit = 20) {
-        return new Promise((resolve, reject) => {
-            this.db.all(
-                `SELECT files.*, users.username 
-                 FROM files 
-                 JOIN users ON files.uploader_id = users.user_id 
-                 WHERE tags LIKE ? 
-                 ORDER BY uploaded_at DESC 
-                 LIMIT ?`,
-                [`%${tag}%`, limit],
-                (err, rows) => {
-                    if (err) reject(err);
-                    else resolve(rows);
-                }
-            );
-        });
+        const sql = `
+            SELECT files.*, users.username
+            FROM files
+            JOIN users ON files.uploader_id = users.user_id
+            WHERE tags LIKE ?
+            ORDER BY uploaded_at DESC
+            LIMIT ?
+        `;
+        return this.all(sql, [`%${tag}%`, limit]);
     }
 
     // ============ POLL METHODS ============
-    createPoll(title, options, createdBy) {
-        return new Promise((resolve, reject) => {
-            this.db.run(
-                'INSERT INTO polls (title, options, created_by) VALUES (?, ?, ?)',
-                [title, JSON.stringify(options), createdBy],
-                function(err) {
-                    if (err) reject(err);
-                    else resolve(this.lastID);
-                }
-            );
-        });
+    createPoll(title, options = [], createdBy) {
+        const sql = 'INSERT INTO polls (title, options, created_by) VALUES (?, ?, ?)';
+        return this.run(sql, [title, JSON.stringify(options), createdBy]).then(res => res.lastID);
     }
 
     voteInPoll(pollId, userId, optionIndex) {
+        const db = this.db;
         return new Promise((resolve, reject) => {
-            this.db.serialize(() => {
-                this.db.run('BEGIN TRANSACTION');
+            db.serialize(() => {
+                db.run('BEGIN TRANSACTION', (err) => {
+                    if (err) return reject(err);
 
-                // Get current votes
-                this.db.get(
-                    'SELECT votes FROM polls WHERE id = ?',
-                    [pollId],
-                    (err, row) => {
+                    db.get('SELECT votes FROM polls WHERE id = ?', [pollId], (err, row) => {
                         if (err) {
-                            this.db.run('ROLLBACK');
+                            db.run('ROLLBACK', () => {});
                             return reject(err);
                         }
 
-                        let votes = row.votes ? JSON.parse(row.votes) : {};
-                        const userVoteKey = `user_${userId}`;
-
-                        // Remove previous vote if exists
-                        if (votes[userVoteKey] !== undefined) {
-                            delete votes[userVoteKey];
+                        let votes = {};
+                        try {
+                            votes = row && row.votes ? JSON.parse(row.votes) : {};
+                        } catch (e) {
+                            votes = {};
                         }
 
-                        // Add new vote
+                        const userVoteKey = `user_${userId}`;
+                        // replace previous vote
                         votes[userVoteKey] = optionIndex;
 
-                        // Update poll
-                        this.db.run(
-                            'UPDATE polls SET votes = ? WHERE id = ?',
-                            [JSON.stringify(votes), pollId],
-                            (err) => {
+                        db.run('UPDATE polls SET votes = ? WHERE id = ?', [JSON.stringify(votes), pollId], (err) => {
+                            if (err) {
+                                db.run('ROLLBACK', () => {});
+                                return reject(err);
+                            }
+
+                            db.run('COMMIT', (err) => {
                                 if (err) {
-                                    this.db.run('ROLLBACK');
+                                    db.run('ROLLBACK', () => {});
                                     return reject(err);
                                 }
-
-                                this.db.run('COMMIT', (err) => {
-                                    if (err) {
-                                        this.db.run('ROLLBACK');
-                                        return reject(err);
-                                    }
-                                    resolve(true);
-                                });
-                            }
-                        );
-                    }
-                );
+                                resolve(true);
+                            });
+                        });
+                    });
+                });
             });
         });
     }
 
     getPollResults(pollId) {
-        return new Promise((resolve, reject) => {
-            this.db.get(
-                `SELECT polls.*, users.username as creator_name 
-                 FROM polls 
-                 JOIN users ON polls.created_by = users.user_id 
-                 WHERE polls.id = ?`,
-                [pollId],
-                (err, row) => {
-                    if (err) reject(err);
-                    else resolve(row);
-                }
-            );
+        const sql = `
+            SELECT polls.*, users.username as creator_name
+            FROM polls
+            JOIN users ON polls.created_by = users.user_id
+            WHERE polls.id = ?
+        `;
+        return this.get(sql, [pollId]).then(row => {
+            if (!row) return null;
+            // parse options & votes
+            try { row.options = JSON.parse(row.options); } catch (e) { row.options = []; }
+            try { row.votes = JSON.parse(row.votes || '{}'); } catch (e) { row.votes = {}; }
+            return row;
         });
     }
 
     // ============ ROLE & PERMISSION METHODS ============
     setUserRole(userId, role) {
-        return new Promise((resolve, reject) => {
-            this.db.run(
-                'INSERT OR REPLACE INTO roles (user_id, role) VALUES (?, ?)',
-                [userId, role],
-                function(err) {
-                    if (err) reject(err);
-                    else resolve(this.changes > 0);
-                }
-            );
-        });
+        return this.run('INSERT OR REPLACE INTO roles (user_id, role) VALUES (?, ?)', [userId, role]).then(r => r.changes > 0);
     }
 
-    getUserRole(userId) {
-        return new Promise((resolve, reject) => {
-            this.db.get(
-                'SELECT role FROM roles WHERE user_id = ?',
-                [userId],
-                (err, row) => {
-                    if (err) reject(err);
-                    else resolve(row ? row.role : 'member');
-                }
-            );
-        });
+    async getUserRole(userId) {
+        const row = await this.get('SELECT role FROM roles WHERE user_id = ?', [userId]);
+        return row ? row.role : 'member';
     }
 
     isAdmin(userId) {
@@ -644,163 +563,71 @@ class Database {
 
     // ============ NOTIFICATION METHODS ============
     createNotification(userId, message, type = 'info') {
-        return new Promise((resolve, reject) => {
-            this.db.run(
-                'INSERT INTO notifications (user_id, message, type) VALUES (?, ?, ?)',
-                [userId, message, type],
-                function(err) {
-                    if (err) reject(err);
-                    else resolve(this.lastID);
-                }
-            );
-        });
+        return this.run('INSERT INTO notifications (user_id, message, type) VALUES (?, ?, ?)', [userId, message, type]).then(r => r.lastID);
     }
 
     getUnreadNotifications(userId) {
-        return new Promise((resolve, reject) => {
-            this.db.all(
-                'SELECT * FROM notifications WHERE user_id = ? AND is_read = FALSE ORDER BY created_at DESC',
-                [userId],
-                (err, rows) => {
-                    if (err) reject(err);
-                    else resolve(rows);
-                }
-            );
-        });
+        return this.all('SELECT * FROM notifications WHERE user_id = ? AND is_read = 0 ORDER BY created_at DESC', [userId]);
     }
 
     markNotificationAsRead(notificationId) {
-        return new Promise((resolve, reject) => {
-            this.db.run(
-                'UPDATE notifications SET is_read = TRUE WHERE id = ?',
-                [notificationId],
-                function(err) {
-                    if (err) reject(err);
-                    else resolve(this.changes > 0);
-                }
-            );
-        });
+        return this.run('UPDATE notifications SET is_read = 1 WHERE id = ?', [notificationId]).then(r => r.changes > 0);
     }
 
     // ============ KARMA & STATS METHODS ============
     getUserKarma(userId) {
-        return new Promise((resolve, reject) => {
-            this.db.get(
-                'SELECT karma FROM users WHERE user_id = ?',
-                [userId],
-                (err, row) => {
-                    if (err) reject(err);
-                    else resolve(row ? row.karma : 0);
-                }
-            );
-        });
+        return this.get('SELECT karma FROM users WHERE user_id = ?', [userId]).then(row => row ? row.karma : 0);
     }
 
     addKarma(userId, amount) {
-        return new Promise((resolve, reject) => {
-            this.db.run(
-                'UPDATE users SET karma = karma + ? WHERE user_id = ?',
-                [amount, userId],
-                (err) => {
-                    if (err) reject(err);
-                    else resolve();
-                }
-            );
-        });
+        return this.run('UPDATE users SET karma = karma + ? WHERE user_id = ?', [amount, userId]);
     }
 
     getTopUsersByKarma(limit = 10) {
-        return new Promise((resolve, reject) => {
-            this.db.all(
-                'SELECT user_id, username, karma FROM users ORDER BY karma DESC LIMIT ?',
-                [limit],
-                (err, rows) => {
-                    if (err) reject(err);
-                    else resolve(rows);
-                }
-            );
-        });
+        return this.all('SELECT user_id, username, karma FROM users ORDER BY karma DESC LIMIT ?', [limit]);
     }
 
     getDashboardStats() {
-        return new Promise((resolve, reject) => {
-            this.db.get(
-                `SELECT 
-                 (SELECT COUNT(*) FROM users) as total_users,
-                 (SELECT COUNT(*) FROM ideas) as total_ideas,
-                 (SELECT COUNT(*) FROM tasks WHERE status = 'Done') as completed_tasks,
-                 (SELECT COUNT(*) FROM tasks) as total_tasks,
-                 (SELECT COUNT(*) FROM users WHERE last_active >= date('now', '-7 days')) as active_users`,
-                (err, row) => {
-                    if (err) reject(err);
-                    else resolve(row);
-                }
-            );
-        });
+        const sql = `
+            SELECT 
+             (SELECT COUNT(*) FROM users) as total_users,
+             (SELECT COUNT(*) FROM ideas) as total_ideas,
+             (SELECT COUNT(*) FROM tasks WHERE status = 'Done') as completed_tasks,
+             (SELECT COUNT(*) FROM tasks) as total_tasks,
+             (SELECT COUNT(*) FROM users WHERE last_active >= date('now', '-7 days')) as active_users
+        `;
+        return this.get(sql, []);
     }
 
-    // ============ UTILITY METHODS ============
+    // ============ SEARCH & UTIL ============
     getUserByUsername(username) {
-        return new Promise((resolve, reject) => {
-            this.db.get('SELECT * FROM users WHERE username = ?', [username], (err, row) => {
-                if (err) reject(err);
-                else resolve(row);
-            });
-        });
+        return this.get('SELECT * FROM users WHERE username = ?', [username]);
     }
 
     searchContent(query, type = 'all') {
-        return new Promise((resolve, reject) => {
-            let sql = '';
-            let params = [`%${query}%`];
-
-            switch (type) {
-                case 'ideas':
-                    sql = `SELECT 'idea' as type, id, title, description, created_at 
-                           FROM ideas 
-                           WHERE title LIKE ? OR description LIKE ? 
-                           ORDER BY created_at DESC`;
-                    params = [params[0], params[0]];
-                    break;
-                case 'tasks':
-                    sql = `SELECT 'task' as type, id, title, description, created_at 
-                           FROM tasks 
-                           WHERE title LIKE ? OR description LIKE ? 
-                           ORDER BY created_at DESC`;
-                    params = [params[0], params[0]];
-                    break;
-                case 'files':
-                    sql = `SELECT 'file' as type, id, title, tags as description, uploaded_at as created_at 
-                           FROM files 
-                           WHERE title LIKE ? OR tags LIKE ? 
-                           ORDER BY uploaded_at DESC`;
-                    params = [params[0], params[0]];
-                    break;
-                default:
-                    sql = `SELECT 'idea' as type, id, title, description, created_at 
-                           FROM ideas 
-                           WHERE title LIKE ? OR description LIKE ? 
-                           UNION
-                           SELECT 'task' as type, id, title, description, created_at 
-                           FROM tasks 
-                           WHERE title LIKE ? OR description LIKE ? 
-                           UNION
-                           SELECT 'file' as type, id, title, tags as description, uploaded_at as created_at 
-                           FROM files 
-                           WHERE title LIKE ? OR tags LIKE ? 
-                           ORDER BY created_at DESC 
-                           LIMIT 20`;
-                    params = [params[0], params[0], params[0], params[0], params[0], params[0]];
-            }
-
-            this.db.all(sql, params, (err, rows) => {
-                if (err) reject(err);
-                else resolve(rows);
-            });
-        });
+        const q = `%${query}%`;
+        if (type === 'ideas') {
+            return this.all(`SELECT 'idea' as type, id, title, description, created_at FROM ideas WHERE title LIKE ? OR description LIKE ? ORDER BY created_at DESC`, [q, q]);
+        } else if (type === 'tasks') {
+            return this.all(`SELECT 'task' as type, id, title, description, created_at FROM tasks WHERE title LIKE ? OR description LIKE ? ORDER BY created_at DESC`, [q, q]);
+        } else if (type === 'files') {
+            return this.all(`SELECT 'file' as type, id, title, tags as description, uploaded_at as created_at FROM files WHERE title LIKE ? OR tags LIKE ? ORDER BY uploaded_at DESC`, [q, q]);
+        } else {
+            const sql = `
+                SELECT 'idea' as type, id, title, description, created_at FROM ideas WHERE title LIKE ? OR description LIKE ?
+                UNION
+                SELECT 'task' as type, id, title, description, created_at FROM tasks WHERE title LIKE ? OR description LIKE ?
+                UNION
+                SELECT 'file' as type, id, title, tags as description, uploaded_at as created_at FROM files WHERE title LIKE ? OR tags LIKE ?
+                ORDER BY created_at DESC
+                LIMIT 20
+            `;
+            return this.all(sql, [q, q, q, q, q, q]);
+        }
     }
 
     close() {
+        if (!this.db) return;
         this.db.close((err) => {
             if (err) {
                 console.error('Error closing database:', err);

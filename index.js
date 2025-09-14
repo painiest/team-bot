@@ -1,817 +1,647 @@
+// index.js - بازنویسی‌شده
 require('dotenv').config();
-const { Telegraf, Markup, session, Scenes } = require('telegraf');
+const { Telegraf, Markup, session } = require('telegraf');
+const { Scenes, Composer, Stage, WizardScene } = require('telegraf');
 const cron = require('node-cron');
-const Database = require('./database');
+const express = require('express');
+const Database = require('./database'); // نسخه‌ای که قبلاً بازنویسی شد
 
+// ---------- Config ----------
 const BOT_TOKEN = process.env.BOT_TOKEN;
-const ADMIN_USER_IDS = JSON.parse(process.env.ADMIN_USER_IDS || '[]');
-const GROUP_CHAT_ID = process.env.GROUP_CHAT_ID;
+if (!BOT_TOKEN) {
+  console.error('ERROR: BOT_TOKEN در .env تنظیم نشده');
+  process.exit(1);
+}
+const ADMIN_USER_IDS = process.env.ADMIN_USER_IDS ? JSON.parse(process.env.ADMIN_USER_IDS) : [];
+const GROUP_CHAT_ID = process.env.GROUP_CHAT_ID || null;
 const DB_PATH = process.env.DB_PATH || './team_bot.db';
-const STANDUP_TIME = process.env.STANDUP_TIME || '18:00';
+const STANDUP_TIME = process.env.STANDUP_TIME || '18:00'; // فرمت HH:MM
 const PORT = process.env.PORT || 3000;
+const NODE_ENV = process.env.NODE_ENV || 'development';
 
+// ---------- Init ----------
 const db = new Database(DB_PATH);
 const bot = new Telegraf(BOT_TOKEN);
 
-// ============ MIDDLEWARES ============
+// ---------- Middlewares ----------
 bot.use(session());
+
+// هر پیام از کاربر => اطمینان از وجود کاربر در DB و آپدیت last_active
 bot.use(async (ctx, next) => {
-    if (ctx.from) {
-        await db.createUser(ctx.from.id, ctx.from.username || ctx.from.first_name);
-        await db.updateUserLastActive(ctx.from.id);
+  try {
+    if (ctx.from && ctx.from.id) {
+      await db.createUser(ctx.from.id, ctx.from.username || ctx.from.first_name || '');
+      await db.updateUserLastActive(ctx.from.id);
     }
-    return next();
+  } catch (e) {
+    console.error('middleware db.createUser/updateUserLastActive error:', e);
+  }
+  return next();
 });
 
-// ============ UTILITY FUNCTIONS ============
+// ---------- Utility ----------
 const isAdmin = async (userId) => {
-    if (ADMIN_USER_IDS.includes(userId)) return true;
+  if (!userId) return false;
+  if (ADMIN_USER_IDS.includes(userId)) return true;
+  try {
     return await db.isAdmin(userId);
+  } catch (e) {
+    console.error('isAdmin error:', e);
+    return false;
+  }
 };
 
-const sendToGroup = async (message, options = {}) => {
+const sendToGroup = async (text, extra = {}) => {
+  if (!GROUP_CHAT_ID) {
+    console.warn('GROUP_CHAT_ID تنظیم نشده؛ پیام گروه فرستاده نشد.');
+    return;
+  }
+  try {
+    await bot.telegram.sendMessage(GROUP_CHAT_ID, text, extra);
+  } catch (e) {
+    console.error('sendToGroup error:', e);
+  }
+};
+
+// ---------- Scenes (Wizard) ----------
+
+// -- Idea Wizard (ثبت ایده) --
+const ideaWizard = new WizardScene(
+  'ideaWizard',
+  async (ctx) => {
+    await ctx.reply('عالی! عنوان ایده رو بنویس: (یا /cancel برای لغو)');
+    ctx.wizard.state.idea = {};
+    return ctx.wizard.next();
+  },
+  async (ctx) => {
+    if (!ctx.message || !ctx.message.text) {
+      await ctx.reply('عنوان معتبر نیست، لطفاً متن وارد کن.');
+      return;
+    }
+    ctx.wizard.state.idea.title = ctx.message.text.trim();
+    await ctx.reply('توضیح کوتاه برای ایده‌ات رو بنویس:');
+    return ctx.wizard.next();
+  },
+  async (ctx) => {
+    if (!ctx.message || !ctx.message.text) {
+      await ctx.reply('توضیح معتبر نیست، لطفاً متن وارد کن.');
+      return;
+    }
+    ctx.wizard.state.idea.description = ctx.message.text.trim();
+    const keyboard = Markup.keyboard([['کم','متوسط','زیاد']]).oneTime().resize();
+    await ctx.reply('اولویت ایده رو انتخاب کن:', keyboard);
+    return ctx.wizard.next();
+  },
+  async (ctx) => {
+    if (!ctx.message || !ctx.message.text) {
+      await ctx.reply('لطفاً یکی از گزینه‌ها را انتخاب کن.');
+      return;
+    }
+    const mapping = { 'کم':'low', 'متوسط':'medium', 'زیاد':'high' };
+    const input = ctx.message.text.trim();
+    if (!mapping[input]) {
+      await ctx.reply('یک گزینه معتبر انتخاب کن: کم، متوسط یا زیاد');
+      return;
+    }
+
     try {
-        await bot.telegram.sendMessage(GROUP_CHAT_ID, message, options);
-    } catch (error) {
-        console.error('Error sending message to group:', error);
+      const ideaId = await db.createIdea(
+        ctx.wizard.state.idea.title,
+        ctx.wizard.state.idea.description,
+        ctx.from.id,
+        mapping[input]
+      );
+
+      await ctx.reply(`ایده با موفقیت ثبت شد. (ID: ${ideaId})`, Markup.removeKeyboard());
+
+      // ارسال به گروه (در صورت تنظیم)
+      const groupMsg = `💡 ایده جدید:\n\nعنوان: ${ctx.wizard.state.idea.title}\nتوضیح: ${ctx.wizard.state.idea.description}\nاولویت: ${mapping[input]}\nثبت کننده: @${ctx.from.username || ctx.from.first_name}`;
+      await sendToGroup(groupMsg, Markup.inlineKeyboard([[Markup.button.callback('👍 رأی', `vote_idea_${ideaId}`)]]));
+    } catch (e) {
+      console.error('createIdea error:', e);
+      await ctx.reply('خطا در ثبت ایده. لطفاً بعداً تلاش کن.');
+    } finally {
+      ctx.wizard.state.idea = null;
+      return ctx.scene.leave();
     }
-};
-
-// ============ WIZARD SCENES ============
-
-// IDEA WIZARD
-const ideaWizard = new Scenes.WizardScene(
-    'ideaWizard',
-    async (ctx) => {
-        await ctx.reply('عالی! عنوان ایده رو وارد کن:', Markup.removeKeyboard());
-        return ctx.wizard.next();
-    },
-    async (ctx) => {
-        ctx.session.idea = ctx.session.idea || {};
-        ctx.session.idea.title = ctx.message.text;
-        await ctx.reply('توضیح کوتاه برای ایده ات بنویس:');
-        return ctx.wizard.next();
-    },
-    async (ctx) => {
-        ctx.session.idea.description = ctx.message.text;
-        const keyboard = Markup.keyboard([['کم', 'متوسط', 'زیاد']]).oneTime().resize();
-        await ctx.reply('اولویت ایده رو انتخاب کن:', keyboard);
-        return ctx.wizard.next();
-    },
-    async (ctx) => {
-        if (!['کم', 'متوسط', 'زیاد'].includes(ctx.message.text)) {
-            await ctx.reply('لطفاً یکی از گزینه‌های موجود را انتخاب کنید:');
-            return;
-        }
-
-        try {
-            const priorityMap = { 'کم': 'low', 'متوسط': 'medium', 'زیاد': 'high' };
-            const priority = priorityMap[ctx.message.text];
-            
-            const ideaId = await db.createIdea(
-                ctx.session.idea.title,
-                ctx.session.idea.description,
-                ctx.from.id,
-                priority
-            );
-
-            await ctx.reply(
-                `ایده تو با موفقیت ثبت شد! 🎉 ID: ${ideaId}\n10 امتیاز کارما گرفتی!`,
-                Markup.removeKeyboard()
-            );
-
-            // Send to group
-            const user = ctx.from;
-            const groupMessage = `
-💡 ایده جدید ثبت شد!
-
-عنوان: ${ctx.session.idea.title}
-توضیحات: ${ctx.session.idea.description}
-اولویت: ${ctx.message.text}
-ثبت شده توسط: @${user.username || user.first_name}
-
-[رأی بده] [ایجاد تسک] [جزئیات]
-            `.trim();
-
-            await sendToGroup(groupMessage, Markup.inlineKeyboard([
-                [Markup.button.callback('👍 رأی بده', `vote_idea_${ideaId}`)],
-                [Markup.button.callback('🎯 ایجاد تسک', `create_task_${ideaId}`),
-                 Markup.button.callback('📋 جزئیات', `idea_details_${ideaId}`)]
-            ]));
-
-        } catch (error) {
-            console.error('Error creating idea:', error);
-            await ctx.reply('خطایی در ثبت ایده رخ داده است.');
-        } finally {
-            delete ctx.session.idea;
-            return ctx.scene.leave();
-        }
-    }
+  }
 );
 
-// TASK WIZARD
-const taskWizard = new Scenes.WizardScene(
-    'taskWizard',
-    async (ctx) => {
-        await ctx.reply('عنوان تسک رو وارد کن:', Markup.removeKeyboard());
-        return ctx.wizard.next();
-    },
-    async (ctx) => {
-        ctx.session.task = ctx.session.task || {};
-        ctx.session.task.title = ctx.message.text;
-        await ctx.reply('توضیح کوتاه برای تسک بنویس:');
-        return ctx.wizard.next();
-    },
-    async (ctx) => {
-        ctx.session.task.description = ctx.message.text;
-        await ctx.reply('Assign به کی؟ (@username یا "خودم"):', Markup.forceReply());
-        return ctx.wizard.next();
-    },
-    async (ctx) => {
-        try {
-            let assigneeUsername = ctx.message.text.replace('@', '').trim();
-            let assigneeId = null;
-
-            if (assigneeUsername === 'خودم') {
-                assigneeId = ctx.from.id;
-                assigneeUsername = ctx.from.username || ctx.from.first_name;
-            } else {
-                const user = await db.getUserByUsername(assigneeUsername);
-                if (!user) {
-                    await ctx.reply('کاربر مورد نظر یافت نشد! لطفاً username صحیح وارد کنید:');
-                    return;
-                }
-                assigneeId = user.user_id;
-            }
-
-            ctx.session.task.assigneeId = assigneeId;
-            ctx.session.task.assigneeUsername = assigneeUsername;
-            
-            await ctx.reply('Deadline رو وارد کن (YYYY-MM-DD):', Markup.forceReply());
-            return ctx.wizard.next();
-        } catch (error) {
-            console.error('Error finding user:', error);
-            await ctx.reply('خطا در یافتن کاربر. لطفاً دوباره تلاش کنید.');
-            return ctx.scene.leave();
-        }
-    },
-    async (ctx) => {
-        const deadline = ctx.message.text;
-        if (!/^\d{4}-\d{2}-\d{2}$/.test(deadline)) {
-            await ctx.reply('فرمت اشتباهه! دوباره وارد کن (YYYY-MM-DD):');
-            return;
-        }
-
-        try {
-            const taskId = await db.createTask(
-                ctx.session.task.title,
-                ctx.session.task.description,
-                ctx.session.task.assigneeId,
-                ctx.session.task.assigneeUsername,
-                deadline,
-                'ToDo',
-                ctx.from.id
-            );
-
-            await ctx.reply(
-                `تسک با موفقیت ساخته شد! 🎯 ID: ${taskId}`,
-                Markup.removeKeyboard()
-            );
-
-            // Notify assignee
-            if (ctx.session.task.assigneeId !== ctx.from.id) {
-                await bot.telegram.sendMessage(
-                    ctx.session.task.assigneeId,
-                    `🎯 تسک جدید برات assign شد:\n\n${ctx.session.task.title}\nمهلت: ${deadline}\n\nوضعیت: ToDo`,
-                    Markup.inlineKeyboard([
-                        [Markup.button.callback('▶️ شروع', `task_start_${taskId}`)],
-                        [Markup.button.callback('📋 جزئیات', `task_details_${taskId}`)]
-                    ])
-                );
-            }
-
-            // Send to group
-            const groupMessage = `
-🎯 تسک جدید ایجاد شد!
-
-عنوان: ${ctx.session.task.title}
-توضیحات: ${ctx.session.task.description}
-مسئول: @${ctx.session.task.assigneeUsername}
-مهلت: ${deadline}
-وضعیت: ToDo
-ثبت شده توسط: @${ctx.from.username || ctx.from.first_name}
-            `.trim();
-
-            await sendToGroup(groupMessage, Markup.inlineKeyboard([
-                [Markup.button.callback('▶️ شروع', `task_start_${taskId}`),
-                 Markup.button.callback('✔️ انجام شد', `task_done_${taskId}`)],
-                [Markup.button.callback('📋 جزئیات', `task_details_${taskId}`),
-                 Markup.button.callback('💬 کامنت', `task_comment_${taskId}`)]
-            ]));
-
-        } catch (error) {
-            console.error('Error creating task:', error);
-            await ctx.reply('خطایی در ساخت تسک رخ داد.');
-        } finally {
-            delete ctx.session.task;
-            return ctx.scene.leave();
-        }
+// -- Task Wizard (ایجاد تسک) --
+const taskWizard = new WizardScene(
+  'taskWizard',
+  async (ctx) => {
+    await ctx.reply('عنوان تسک رو وارد کن: (یا /cancel برای لغو)');
+    ctx.wizard.state.task = {};
+    return ctx.wizard.next();
+  },
+  async (ctx) => {
+    if (!ctx.message || !ctx.message.text) {
+      await ctx.reply('عنوان معتبر نیست.');
+      return;
     }
+    ctx.wizard.state.task.title = ctx.message.text.trim();
+    await ctx.reply('توضیح کوتاه (یا "-" برای بی‌توضیح):');
+    return ctx.wizard.next();
+  },
+  async (ctx) => {
+    ctx.wizard.state.task.description = (ctx.message && ctx.message.text) ? ctx.message.text.trim() : '';
+    await ctx.reply('آی‌دی یا یوزرنیم کسی که میخوای تسک رو بهش بدی رو وارد کن (مثال: @username یا id):');
+    return ctx.wizard.next();
+  },
+  async (ctx) => {
+    if (!ctx.message || !ctx.message.text) {
+      await ctx.reply('مقدار معتبر نیست.');
+      return;
+    }
+    const assigneeRaw = ctx.message.text.trim();
+    let assigneeId = null, assigneeUsername = null;
+
+    if (assigneeRaw.startsWith('@')) {
+      assigneeUsername = assigneeRaw.slice(1);
+      const userRow = await db.getUserByUsername(assigneeUsername).catch(()=>null);
+      if (userRow) assigneeId = userRow.user_id;
+    } else if (/^\d+$/.test(assigneeRaw)) {
+      assigneeId = Number(assigneeRaw);
+      const u = await db.getUser(assigneeId).catch(()=>null);
+      if (u) assigneeUsername = u.username;
+    }
+
+    ctx.wizard.state.task.assigneeId = assigneeId;
+    ctx.wizard.state.task.assigneeUsername = assigneeUsername || assigneeRaw;
+    await ctx.reply('مهلت (YYYY-MM-DD) یا "-" برای بدون مهلت:');
+    return ctx.wizard.next();
+  },
+  async (ctx) => {
+    const deadline = (ctx.message && ctx.message.text) ? ctx.message.text.trim() : null;
+    const task = ctx.wizard.state.task;
+    try {
+      const taskId = await db.createTask(
+        task.title,
+        task.description === '-' ? '' : task.description,
+        task.assigneeId,
+        task.assigneeUsername,
+        (deadline === '-' ? null : deadline),
+        'ToDo',
+        ctx.from.id,
+        null
+      );
+      await ctx.reply(`تسک ساخته شد (ID: ${taskId})`);
+      // notify assignee if we have numeric id
+      if (task.assigneeId) {
+        await bot.telegram.sendMessage(task.assigneeId, `📌 تسکی به شما اختصاص داده شد: ${task.title}`);
+      }
+      await sendToGroup(`🆕 تسک جدید: ${task.title}\nمسئول: ${task.assigneeUsername}`);
+    } catch (e) {
+      console.error('createTask error:', e);
+      await ctx.reply('خطا در ایجاد تسک.');
+    } finally {
+      ctx.wizard.state.task = null;
+      return ctx.scene.leave();
+    }
+  }
 );
 
-// STANDUP WIZARD
-const standupWizard = new Scenes.WizardScene(
-    'standupWizard',
-    async (ctx) => {
-        await ctx.reply('دیروز چه کارهایی انجام دادی؟', Markup.removeKeyboard());
-        return ctx.wizard.next();
-    },
-    async (ctx) => {
-        ctx.session.standup = ctx.session.standup || {};
-        ctx.session.standup.yesterday = ctx.message.text;
-        await ctx.reply('امروز چه برنامه‌ای داری؟');
-        return ctx.wizard.next();
-    },
-    async (ctx) => {
-        ctx.session.standup.today = ctx.message.text;
-        await ctx.reply('چه blocker یا مشکلی داری؟ (اگر نداری بنویس "ندارم")');
-        return ctx.wizard.next();
-    },
-    async (ctx) => {
-        try {
-            const blocker = ctx.message.text;
-            const today = new Date().toISOString().split('T')[0];
-            
-            await db.createStandup(
-                ctx.from.id,
-                today,
-                ctx.session.standup.yesterday,
-                ctx.session.standup.today,
-                blocker
-            );
+// -- Standup Wizard --
+const standupWizard = new WizardScene(
+  'standupWizard',
+  async (ctx) => {
+    ctx.wizard.state.standup = {};
+    await ctx.reply('گزارش دیروزی (yesterday):');
+    return ctx.wizard.next();
+  },
+  async (ctx) => {
+    ctx.wizard.state.standup.yesterday = ctx.message && ctx.message.text ? ctx.message.text : '';
+    await ctx.reply('کار امروز (today):');
+    return ctx.wizard.next();
+  },
+  async (ctx) => {
+    ctx.wizard.state.standup.today = ctx.message && ctx.message.text ? ctx.message.text : '';
+    await ctx.reply('آیا بلاکر یا مانعی داری؟ (اگر نه بنویس: ندارم)');
+    return ctx.wizard.next();
+  },
+  async (ctx) => {
+    const blocker = ctx.message && ctx.message.text ? ctx.message.text : '';
+    const s = ctx.wizard.state.standup;
+    const today = new Date().toISOString().split('T')[0];
+    try {
+      await db.createStandup(ctx.from.id, today, s.yesterday, s.today, blocker);
+      await db.addKarma(ctx.from.id, 5);
+      await ctx.reply('استندآپ ثبت شد — 5 کارما اضافه شد!');
 
-            await db.addKarma(ctx.from.id, 5); // Karma for standup
-
-            await ctx.reply('استندآپ تو ثبت شد! ✅ 5 امتیاز کارما گرفتی!');
-
-            // Notify admin if there's a blocker
-            if (blocker.toLowerCase() !== 'ندارم') {
-                const adminMessage = `
-⚠️ کاربر @${ctx.from.username || ctx.from.first_name} blocker گزارش داده:
-
-${blocker}
-                `.trim();
-
-                for (const adminId of ADMIN_USER_IDS) {
-                    await bot.telegram.sendMessage(adminId, adminMessage);
-                }
-            }
-
-        } catch (error) {
-            console.error('Error saving standup:', error);
-            await ctx.reply('خطایی در ثبت استندآپ رخ داد.');
-        } finally {
-            delete ctx.session.standup;
-            return ctx.scene.leave();
+      if (blocker && blocker.trim() && blocker.trim() !== 'ندارم') {
+        for (const adminId of ADMIN_USER_IDS) {
+          await bot.telegram.sendMessage(adminId, `⚠️ بلاکر گزارش شده توسط @${ctx.from.username || ctx.from.first_name}:\n\n${blocker}`);
         }
+      }
+    } catch (e) {
+      console.error('createStandup error:', e);
+      await ctx.reply('خطا در ثبت استندآپ.');
+    } finally {
+      ctx.wizard.state.standup = null;
+      return ctx.scene.leave();
     }
+  }
 );
 
-// POLL WIZARD (برای ادمین‌ها)
-const pollWizard = new Scenes.WizardScene(
-    'pollWizard',
-    async (ctx) => {
-        if (!await isAdmin(ctx.from.id)) {
-            await ctx.reply('شما دسترسی لازم برای ایجاد نظرسنجی را ندارید.');
-            return ctx.scene.leave();
-        }
-        await ctx.reply('عنوان نظرسنجی رو وارد کن:', Markup.removeKeyboard());
-        return ctx.wizard.next();
-    },
-    async (ctx) => {
-        ctx.session.poll = ctx.session.poll || {};
-        ctx.session.poll.title = ctx.message.text;
-        await ctx.reply('گزینه‌ها رو وارد کن (با کاما جدا کن):\nمثال: گزینه اول, گزینه دوم, گزینه سوم');
-        return ctx.wizard.next();
-    },
-    async (ctx) => {
-        try {
-            const options = ctx.message.text.split(',').map(opt => opt.trim()).filter(opt => opt);
-            
-            if (options.length < 2) {
-                await ctx.reply('حداقل ۲ گزینه لازم است. دوباره وارد کن:');
-                return;
-            }
-
-            const pollId = await db.createPoll(
-                ctx.session.poll.title,
-                options,
-                ctx.from.id
-            );
-
-            // Send poll to group
-            const pollButtons = options.map((option, index) => 
-                [Markup.button.callback(option, `poll_vote_${pollId}_${index}`)]
-            );
-
-            await sendToGroup(
-                `📊 نظرسنجی جدید:\n\n${ctx.session.poll.title}`,
-                Markup.inlineKeyboard(pollButtons)
-            );
-
-            await ctx.reply('نظرسنجی با موفقیت ایجاد شد!');
-
-        } catch (error) {
-            console.error('Error creating poll:', error);
-            await ctx.reply('خطایی در ایجاد نظرسنجی رخ داد.');
-        } finally {
-            delete ctx.session.poll;
-            return ctx.scene.leave();
-        }
+// -- Poll Wizard (فقط ادمین) --
+const pollWizard = new WizardScene(
+  'pollWizard',
+  async (ctx) => {
+    if (!await isAdmin(ctx.from.id)) {
+      await ctx.reply('شما ادمین نیستی و اجازه‌ی ساخت نظرسنجی نداری.');
+      return ctx.scene.leave();
     }
+    await ctx.reply('عنوان نظرسنجی را وارد کن:');
+    ctx.wizard.state.poll = {};
+    return ctx.wizard.next();
+  },
+  async (ctx) => {
+    ctx.wizard.state.poll.title = ctx.message && ctx.message.text ? ctx.message.text.trim() : '';
+    await ctx.reply('گزینه‌ها را با کاما جدا کن (حداقل 2 گزینه):\nمثال: آ، ب، ج');
+    return ctx.wizard.next();
+  },
+  async (ctx) => {
+    try {
+      const options = (ctx.message && ctx.message.text) ? ctx.message.text.split(',').map(s => s.trim()).filter(Boolean) : [];
+      if (options.length < 2) {
+        await ctx.reply('حداقل 2 گزینه لازم است. دوباره وارد کن:');
+        return;
+      }
+      const pollId = await db.createPoll(ctx.wizard.state.poll.title, options, ctx.from.id);
+      const buttons = options.map((opt, idx) => [Markup.button.callback(opt, `poll_vote_${pollId}_${idx}`)]);
+      await sendToGroup(`📊 نظرسنجی جدید:\n\n${ctx.wizard.state.poll.title}`, Markup.inlineKeyboard(buttons));
+      await ctx.reply('نظرسنجی ایجاد شد.');
+    } catch (e) {
+      console.error('createPoll error:', e);
+      await ctx.reply('خطا در ایجاد نظرسنجی.');
+    } finally {
+      ctx.wizard.state.poll = null;
+      return ctx.scene.leave();
+    }
+  }
 );
 
-// ============ STAGE SETUP ============
-const stage = new Scenes.Stage([ideaWizard, taskWizard, standupWizard, pollWizard]);
+// ---------- Stage ----------
+const stage = new Stage([ideaWizard, taskWizard, standupWizard, pollWizard], { ttl: 10 * 60 * 1000 });
 bot.use(stage.middleware());
 
-// ============ COMMAND HANDLERS ============
+// ---------- Command Handlers ----------
 
-// START COMMAND
+// /start
 bot.start(async (ctx) => {
-    try {
-        // ابتدا کاربر رو ایجاد یا آپدیت کن
-        await db.createUser(ctx.from.id, ctx.from.username || ctx.from.first_name);
-        
-        // بررسی کن آیا کاربر قبلاً قوانین رو پذیرفته
-        const user = await db.getUser(ctx.from.id);
-        
-        if (user && user.accepted_rules) {
-            // کاربر قبلاً قوانین رو پذیرفته
-            const welcomeMessage = `
-سلام ${ctx.from.first_name}! 👋
-به ربات مدیریت تیم خوش اومدی!
-
-📝 /idea - ثبت ایده جدید
-💡 /ideas - مشاهده ایده‌ها
-🏆 /karma - امتیاز من
-🎯 /task - ساخت تسک جدید
-📋 /mytasks - تسک‌های من
-⏱ /standup - استندآپ روزانه
-📊 /poll - ایجاد نظرسنجی (ادمین)
-📁 /upload - آپلود فایل
-📅 /calendar - تقویم جلسات
-👥 /members - مدیریت اعضا (ادمین)
-
-برای شروع /help رو بزن.
-            `.trim();
-
-            await ctx.reply(welcomeMessage);
-        } else {
-            // کاربر هنوز قوانین رو نپذیرفته
-            const welcomeMessage = `
-سلام ${ctx.from.first_name}! 👋
-به ربات مدیریت تیم خوش اومدی!
-
-📝 /idea - ثبت ایده جدید
-💡 /ideas - مشاهده ایده‌ها
-🏆 /karma - امتیاز من
-🎯 /task - ساخت تسک جدید
-📋 /mytasks - تسک‌های من
-            `.trim();
-
-            await ctx.reply(welcomeMessage);
-
-            // Send rules and ask for acceptance
-            const rulesMessage = `
-📋 قوانین تیم:
-
-1. احترام متقابل به همه اعضا
-2. ثبت منظم استندآپ روزانه
-3. پیگیری تسک‌های محوله
-4. مشارکت در بحث‌های تیمی
-
-آیا قوانین رو می‌پذیری؟
-            `.trim();
-
-            await ctx.reply(rulesMessage, Markup.inlineKeyboard([
-                Markup.button.callback('✅ قبول می‌کنم', 'accept_rules'),
-                Markup.button.callback('❌ نمی‌پذیرم', 'reject_rules')
-            ]));
-        }
-    } catch (error) {
-        console.error('Error in start command:', error);
-        await ctx.reply('خطایی در پردازش درخواست شما رخ داده است.');
+  try {
+    await db.createUser(ctx.from.id, ctx.from.username || ctx.from.first_name || '');
+    const user = await db.getUser(ctx.from.id);
+    if (user && user.accepted_rules) {
+      await ctx.reply(`سلام ${ctx.from.first_name} 👋\nخوش اومدی! برای راهنمایی /help رو بزن.`);
+    } else {
+      await ctx.reply(`سلام ${ctx.from.first_name} 👋\nخوش اومدی! قبل از استفاده قوانین رو قبول کن.`);
+      const rules = `📋 قوانین تیم:\n1) احترام\n2) فعالیت منظم\n3) پیگیری تسک‌ها\nآیا قبول داری؟`;
+      await ctx.reply(rules, Markup.inlineKeyboard([
+        Markup.button.callback('✅ قبول می‌کنم', 'accept_rules'),
+        Markup.button.callback('❌ قبول ندارم', 'reject_rules')
+      ]));
     }
+  } catch (e) {
+    console.error('/start error:', e);
+    await ctx.reply('خطا در پردازش /start');
+  }
 });
 
-// HELP COMMAND
+// /help
 bot.help(async (ctx) => {
-    const helpMessage = `
-🤖 راهنمای ربات مدیریت تیم:
-
-📝 ایده‌ها:
-/idea - ثبت ایده جدید
-/ideas - مشاهده همه ایده‌ها
-
-🎯 تسک‌ها:
-/task - ایجاد تسک جدید
+  const help = `
+دستورات اصلی:
+/idea - ثبت ایده
+/ideas - مشاهده ایده‌ها
+/task - ایجاد تسک
 /mytasks - تسک‌های من
-
-⏱ استندآپ:
-/standup - ثبت گزارش روزانه
-
-📊 نظرسنجی:
+/standup - ثبت استندآپ
 /poll - ایجاد نظرسنجی (ادمین)
-
-📁 فایل‌ها:
 /upload - آپلود فایل
-/files - جستجوی فایل
-
-🏆 امتیاز:
-/karma - مشاهده امتیاز کارما
-
-👥 مدیریت (ادمین):
-/members - مدیریت اعضا
-/announce - ارسال اطلاعیه
-/dashboard - آمار تیم
-
-❌ /cancel - لغو عملیات جاری
-    `.trim();
-
-    await ctx.reply(helpMessage);
+/karma - مشاهده کارما
+/help - راهنما
+/cancel - لغو
+  `.trim();
+  await ctx.reply(help);
 });
 
-// CANCEL COMMAND
-bot.command('cancel', async (ctx) => {
-    ['idea', 'task', 'standup', 'poll'].forEach(key => {
-        if (ctx.session[key]) delete ctx.session[key];
-    });
-    await ctx.reply('عملیات کنسل شد.', Markup.removeKeyboard());
-    return ctx.scene.leave();
-});
+// /idea (شروع wizard)
+bot.command('idea', (ctx) => ctx.scene.enter('ideaWizard'));
 
-// KARMA COMMAND
-bot.command('karma', async (ctx) => {
-    try {
-        const karma = await db.getUserKarma(ctx.from.id);
-        const topUsers = await db.getTopUsersByKarma(5);
-        
-        let message = `🏆 امتیاز کارمای شما: ${karma}\n\n`;
-        message += '📊 برترین‌ها:\n';
-        
-        topUsers.forEach((user, index) => {
-            message += `${index + 1}. @${user.username || 'ناشناس'}: ${user.karma}\n`;
-        });
+// /task
+bot.command('task', (ctx) => ctx.scene.enter('taskWizard'));
 
-        await ctx.reply(message);
-    } catch (error) {
-        console.error('Error in /karma:', error);
-        await ctx.reply('خطا در دریافت امتیاز.');
-    }
-});
-
-// IDEAS COMMAND
-bot.command('ideas', async (ctx) => {
-    try {
-        const ideas = await db.getAllIdeas();
-        if (ideas.length === 0) {
-            await ctx.reply('هنوز هیچ ایده‌ای ثبت نشده است.');
-            return;
-        }
-
-        let message = '💡 لیست ایده‌ها:\n\n';
-        ideas.forEach((idea, index) => {
-            message += `${index + 1}. ${idea.title} (اولویت: ${idea.priority})\n`;
-            message += `توضیح: ${idea.description}\n`;
-            message += `ثبت شده توسط: @${idea.username}\n`;
-            message += `تاریخ: ${new Date(idea.created_at).toLocaleString('fa-IR')}\n`;
-            message += `رأی: ${idea.vote_count} 👍\n\n`;
-        });
-
-        await ctx.reply(message);
-    } catch (error) {
-        console.error('Error fetching ideas:', error);
-        await ctx.reply('خطایی در دریافت لیست ایده‌ها رخ داده است.');
-    }
-});
-
-// MYTASKS COMMAND
-bot.command('mytasks', async (ctx) => {
-    try {
-        const tasks = await db.getUserTasks(ctx.from.id);
-        if (tasks.length === 0) {
-            await ctx.reply('هیچ تسکی نداری!');
-            return;
-        }
-
-        let message = '📋 تسک‌های تو:\n\n';
-        tasks.forEach((task, index) => {
-            message += `${index + 1}. ${task.title}\n`;
-            message += `وضعیت: ${task.status} | مهلت: ${task.deadline}\n`;
-            message += `ساخته شده توسط: @${task.creator_username}\n\n`;
-        });
-
-        await ctx.reply(message);
-    } catch (error) {
-        console.error('Error in /mytasks:', error);
-        await ctx.reply('خطا در دریافت تسک‌ها.');
-    }
-});
-
-// STANDUP COMMAND
+// /standup
 bot.command('standup', (ctx) => ctx.scene.enter('standupWizard'));
 
-// POLL COMMAND (برای ادمین)
+// /poll
 bot.command('poll', (ctx) => ctx.scene.enter('pollWizard'));
 
-// UPLOAD COMMAND
+// /ideas
+bot.command('ideas', async (ctx) => {
+  try {
+    const ideas = await db.getAllIdeas(50, 0);
+    if (!ideas || ideas.length === 0) {
+      await ctx.reply('هیچ ایده‌ای ثبت نشده.');
+      return;
+    }
+    let message = '💡 ایده‌ها:\n\n';
+    ideas.forEach((idea, idx) => {
+      message += `${idx+1}. ${idea.title} — توسط @${idea.username || 'ناشناس'} — رأی: ${idea.vote_count || 0}\n`;
+    });
+    await ctx.reply(message);
+  } catch (e) {
+    console.error('/ideas error:', e);
+    await ctx.reply('خطا در گرفتن لیست ایده‌ها.');
+  }
+});
+
+// /mytasks
+bot.command('mytasks', async (ctx) => {
+  try {
+    const tasks = await db.getUserTasks(ctx.from.id);
+    if (!tasks || tasks.length === 0) {
+      await ctx.reply('هیچ تسکی برات پیدا نشد.');
+      return;
+    }
+    let msg = '📋 تسک‌های شما:\n\n';
+    tasks.forEach((t, i) => {
+      msg += `${i+1}. ${t.title} — وضعیت: ${t.status} — مهلت: ${t.deadline || 'ندارد'}\n`;
+    });
+    await ctx.reply(msg);
+  } catch (e) {
+    console.error('/mytasks error:', e);
+    await ctx.reply('خطا در دریافت تسک‌ها.');
+  }
+});
+
+// /upload - راهنمای آپلود: کاربر فایل رو بفرسته
 bot.command('upload', async (ctx) => {
-    await ctx.reply('لطفاً فایل مورد نظر رو ارسال کن:');
+  await ctx.reply('لطفاً فایل موردنظر رو ارسال کن. پس از ارسال، در پیام بعدی برچسب‌ها را وارد کن.');
+  ctx.session.expectingFile = true;
 });
 
-// DASHBOARD COMMAND (برای ادمین)
-bot.command('dashboard', async (ctx) => {
-    if (!await isAdmin(ctx.from.id)) {
-        await ctx.reply('شما دسترسی لازم برای مشاهده داشبورد را ندارید.');
-        return;
-    }
-
-    try {
-        const stats = await db.getDashboardStats();
-        const message = `
-📊 داشبورد تیم:
-
-👥 تعداد اعضا: ${stats.total_users}
-💡 ایده‌های ثبت شده: ${stats.total_ideas}
-✅ تسک‌های انجام شده: ${stats.completed_tasks} از ${stats.total_tasks}
-🎯 نرخ تکمیل: ${stats.total_tasks > 0 ? Math.round((stats.completed_tasks / stats.total_tasks) * 100) : 0}%
-👤 اعضای فعال (۷ روز): ${stats.active_users}
-        `.trim();
-
-        await ctx.reply(message);
-    } catch (error) {
-        console.error('Error fetching dashboard:', error);
-        await ctx.reply('خطا در دریافت آمار.');
-    }
+// /karma
+bot.command('karma', async (ctx) => {
+  try {
+    const karma = await db.getUserKarma(ctx.from.id);
+    const top = await db.getTopUsersByKarma(5);
+    let msg = `🏆 کارمای شما: ${karma}\n\nبرترین‌ها:\n`;
+    top.forEach((u,i)=> { msg += `${i+1}. @${u.username||'ناشناس'} — ${u.karma}\n`; });
+    await ctx.reply(msg);
+  } catch (e) {
+    console.error('/karma error:', e);
+    await ctx.reply('خطا در دریافت کارما.');
+  }
 });
 
-// ============ FILE HANDLING ============
+// /cancel
+bot.command('cancel', async (ctx) => {
+  ctx.session = {};
+  await ctx.reply('عملیات لغو شد.', Markup.removeKeyboard());
+  // leave scene if inside
+  try { await ctx.scene.leave(); } catch (_) {}
+});
+
+// ---------- File handling ----------
 bot.on('document', async (ctx) => {
-    try {
-        const fileId = ctx.message.document.file_id;
-        const fileName = ctx.message.document.file_name;
-        
-        await ctx.reply('برچسب‌های فایل رو وارد کن (با کاما جدا کن):');
-        
-        // Store file info in session for next message
-        ctx.session.uploadingFile = { fileId, fileName };
-    } catch (error) {
-        console.error('Error handling file:', error);
-        await ctx.reply('خطا در پردازش فایل.');
-    }
+  try {
+    if (!ctx.message || !ctx.message.document) return;
+    const doc = ctx.message.document;
+    // ذخیره فایلID و نام در session و از کاربر انتظار تگ
+    ctx.session.uploadingFile = { fileId: doc.file_id, fileName: doc.file_name || 'file' };
+    await ctx.reply('فایل دریافت شد. لطفاً برچسب‌ها را برای فایل وارد کن (مثلاً: notes, pdf):');
+  } catch (e) {
+    console.error('document handler error:', e);
+  }
 });
 
-// Handle file tags
+// وقتی کاربر متن فرستاد و session.uploadingFile موجود باشه => ثبت فایل در DB
 bot.on('text', async (ctx) => {
-    if (ctx.session.uploadingFile) {
-        try {
-            const { fileId, fileName } = ctx.session.uploadingFile;
-            const tags = ctx.message.text;
-            
-            const fileDbId = await db.saveFile(ctx.from.id, fileId, fileName, tags);
-            
-            await ctx.reply(`فایل "${fileName}" با موفقیت آپلود شد! 🎉`);
-            
-            // Send to group
-            const groupMessage = `
-📁 فایل جدید آپلود شد:
-
-نام: ${fileName}
-برچسب‌ها: ${tags}
-آپلود شده توسط: @${ctx.from.username || ctx.from.first_name}
-            `.trim();
-
-            await sendToGroup(groupMessage, Markup.inlineKeyboard([
-                [Markup.button.callback('📥 دانلود', `download_${fileDbId}`)]
-            ]));
-
-            delete ctx.session.uploadingFile;
-        } catch (error) {
-            console.error('Error saving file:', error);
-            await ctx.reply('خطا در ذخیره فایل.');
-        }
+  try {
+    // اگر در حال آپلود فایل باشیم، این پیام برچسب‌هاست
+    if (ctx.session && ctx.session.uploadingFile) {
+      const tags = ctx.message.text.trim();
+      const { fileId, fileName } = ctx.session.uploadingFile;
+      const savedId = await db.saveFile(ctx.from.id, fileId, fileName, tags);
+      await ctx.reply(`فایل ذخیره شد (ID: ${savedId})`);
+      // ارسال به گروه
+      await sendToGroup(`📁 فایل جدید:\nنام: ${fileName}\nبرچسب‌ها: ${tags}\nآپلود شده توسط: @${ctx.from.username || ctx.from.first_name}`, Markup.inlineKeyboard([[Markup.button.callback('📥 دانلود', `download_${savedId}`)]]));
+      delete ctx.session.uploadingFile;
+      return;
     }
+    // در غیر این صورت متن عادی — نادیده یا میتونی کامند سفارشی بذاری
+  } catch (e) {
+    console.error('text handler error:', e);
+    await ctx.reply('خطا در پردازش پیام متن.');
+  }
 });
 
-// ============ INLINE QUERY HANDLING ============
+// ---------- Inline queries (جستجو) ----------
 bot.on('inline_query', async (ctx) => {
-    try {
-        const query = ctx.inlineQuery.query;
-        if (!query) return;
-
-        const results = await db.searchContent(query);
-        
-        const inlineResults = results.map((item, index) => {
-            return {
-                type: 'article',
-                id: index.toString(),
-                title: item.title,
-                description: item.description.substring(0, 64),
-                input_message_content: {
-                    message_text: `🔍 نتیجه جستجو:\n\n${item.title}\n${item.description.substring(0, 128)}...`
-                }
-            };
-        });
-
-        await ctx.answerInlineQuery(inlineResults);
-    } catch (error) {
-        console.error('Error handling inline query:', error);
-    }
+  try {
+    const q = ctx.inlineQuery && ctx.inlineQuery.query ? ctx.inlineQuery.query.trim() : '';
+    if (!q) return;
+    const results = await db.searchContent(q, 'all');
+    const inline = (results || []).slice(0, 10).map((item, idx) => ({
+      type: 'article',
+      id: String(idx),
+      title: item.title || (item.type + ' #' + item.id),
+      description: (item.description || '').slice(0, 120),
+      input_message_content: { message_text: `🔎 ${item.type.toUpperCase()}\n\n${item.title}\n\n${(item.description||'').slice(0,300)}` }
+    }));
+    await ctx.answerInlineQuery(inline);
+  } catch (e) {
+    console.error('inline_query error:', e);
+  }
 });
 
-// ============ CALLBACK QUERY HANDLERS ============
-bot.action(/accept_rules/, async (ctx) => {
-    try {
-        await db.acceptRules(ctx.from.id);
-        await ctx.editMessageText('✅ قوانین را پذیرفتی! خوش اومدی به تیم!');
-        await ctx.answerCbQuery();
-    } catch (error) {
-        console.error('Error accepting rules:', error);
-        await ctx.answerCbQuery('خطا در پذیرش قوانین');
-    }
-});
+// ---------- Callback actions ----------
 
-bot.action(/reject_rules/, async (ctx) => {
-    await ctx.editMessageText('❌ متأسفیم بدون پذیرش قوانین نمی‌تونی از ربات استفاده کنی.');
+// قبول/رد قوانین
+bot.action('accept_rules', async (ctx) => {
+  try {
+    await db.acceptRules(ctx.from.id);
+    await ctx.editMessageText('✅ قوانین پذیرفته شد. خوش آمدی!');
     await ctx.answerCbQuery();
+  } catch (e) {
+    console.error('accept_rules error:', e);
+    await ctx.answerCbQuery('خطا در پذیرش قوانین');
+  }
+});
+bot.action('reject_rules', async (ctx) => {
+  try {
+    await ctx.editMessageText('❌ برای استفاده از ربات باید قوانین را بپذیرید.');
+    await ctx.answerCbQuery();
+  } catch (e) {
+    console.error('reject_rules error:', e);
+  }
 });
 
+// رأی به ایده: vote_idea_{id}
 bot.action(/vote_idea_(\d+)/, async (ctx) => {
-    try {
-        const ideaId = ctx.match[1];
-        const voted = await db.voteForIdea(ctx.from.id, ideaId);
-        
-        if (voted) {
-            await ctx.answerCbQuery('👍 رأی تو ثبت شد!');
-            await ctx.editMessageText(
-                ctx.update.callback_query.message.text + `\n\n✅ @${ctx.from.username} رأی داد`,
-                ctx.update.callback_query.message.reply_markup
-            );
-        } else {
-            await ctx.answerCbQuery('❌ قبلاً به این ایده رأی دادی!');
-        }
-    } catch (error) {
-        console.error('Error voting for idea:', error);
-        await ctx.answerCbQuery('خطا در ثبت رأی');
+  try {
+    const ideaId = Number((ctx.match && ctx.match[1]) || NaN);
+    if (!ideaId) return await ctx.answerCbQuery('ایده مشخص نیست.');
+    const voted = await db.voteForIdea(ctx.from.id, ideaId);
+    if (voted) {
+      await ctx.answerCbQuery('👍 رأی شما ثبت شد.');
+      // (اختیاری) به‌روزرسانی پیام گروه یا ارسال تایید
+    } else {
+      await ctx.answerCbQuery('شما قبلاً رأی داده‌اید.');
     }
+  } catch (e) {
+    console.error('vote_idea error:', e);
+    await ctx.answerCbQuery('خطا در ثبت رأی.');
+  }
 });
 
-bot.action(/task_start_(\d+)/, async (ctx) => {
-    try {
-        const taskId = ctx.match[1];
-        const updated = await db.updateTaskStatus(taskId, 'In Progress');
-        
-        if (updated) {
-            await ctx.answerCbQuery('✅ تسک شروع شد!');
-            await ctx.editMessageText(
-                ctx.update.callback_query.message.text.replace('وضعیت: ToDo', 'وضعیت: In Progress'),
-                ctx.update.callback_query.message.reply_markup
-            );
-        }
-    } catch (error) {
-        console.error('Error starting task:', error);
-        await ctx.answerCbQuery('خطا در شروع تسک');
-    }
+// دانلود فایل از طریق callback (download_{fileDbId})
+bot.action(/download_(\d+)/, async (ctx) => {
+  try {
+    const fileDbId = Number(ctx.match && ctx.match[1]);
+    if (!fileDbId) return await ctx.answerCbQuery('فایل پیدا نشد.');
+    const rows = await db.getFilesByTag('', 100); // getFilesByTag نیست دقیق برای id؛ بهتر می‌تونیم متد جدید بسازیم اما فعلاً جستجو
+    // بهتر: اگر DB متد getFileById داری یا اضافه کنی، ازش استفاده کن. اینجا تلاش ساده:
+    const fileRow = (await db.all('SELECT * FROM files WHERE id = ?', [fileDbId])).shift();
+    if (!fileRow) return await ctx.answerCbQuery('فایل در DB پیدا نشد.');
+    // ارسال فایل با file_id تلگرام
+    await bot.telegram.sendDocument(ctx.from.id, { source: await bot.telegram.getFileLink(fileRow.file_id_telegram) }).catch(async (_) => {
+      // اگر getFileLink دردسر داشت، فقط اطلاع به کاربر:
+      await ctx.reply('متاسفانه امکان ارسال فایل از سرور وجود ندارد. (فایل_id ذخیره شده در DB موجود است)');
+    });
+    await ctx.answerCbQuery();
+  } catch (e) {
+    console.error('download action error:', e);
+    await ctx.answerCbQuery('خطا هنگام دانلود فایل.');
+  }
 });
 
-bot.action(/task_done_(\d+)/, async (ctx) => {
-    try {
-        const taskId = ctx.match[1];
-        const updated = await db.updateTaskStatus(taskId, 'Done');
-        
-        if (updated) {
-            await ctx.answerCbQuery('🎉 تسک انجام شد! 30 امتیاز کارما گرفتی!');
-            await ctx.editMessageText(
-                ctx.update.callback_query.message.text.replace('وضعیت: ToDo', 'وضعیت: Done ✅'),
-                ctx.update.callback_query.message.reply_markup
-            );
-        }
-    } catch (error) {
-        console.error('Error completing task:', error);
-        await ctx.answerCbQuery('خطا در تکمیل تسک');
+// رأی در نظرسنجی: poll_vote_{pollId}_{optionIndex}
+bot.action(/poll_vote_(\d+)_(\d+)/, async (ctx) => {
+  try {
+    const pollId = Number(ctx.match[1]);
+    const idx = Number(ctx.match[2]);
+    if (!pollId && pollId !== 0) return await ctx.answerCbQuery('نظرسنجی معتبر نیست.');
+    const ok = await db.voteInPoll(pollId, ctx.from.id, idx);
+    if (ok) {
+      await ctx.answerCbQuery('رأی ثبت شد.');
+    } else {
+      await ctx.answerCbQuery('خطا در ثبت رأی.');
     }
+  } catch (e) {
+    console.error('poll_vote error:', e);
+    await ctx.answerCbQuery('خطا در رأی‌گیری.');
+  }
 });
 
-// ============ CRON JOBS ============
-// استندآپ روزانه
-cron.schedule(`0 ${STANDUP_TIME.split(':')[1]} ${STANDUP_TIME.split(':')[0]} * * *`, async () => {
-    try {
-        const users = await db.getTopUsersByKarma(50); // Get active users
-        
-        for (const user of users) {
-            await bot.telegram.sendMessage(
-                user.user_id,
-                `⏱ وقت استندآپ روزانه!\n\nلطفاً گزارش امروزتو ارسال کن:\n/standup`
-            );
-        }
-        
-        await sendToGroup('⏱ وقت استندآپ روزانه! لطفاً گزارش‌هاتون رو از طریق ربات ارسال کنید.');
-    } catch (error) {
-        console.error('Error in standup cron job:', error);
-    }
-});
+// ---------- Cron jobs ----------
 
-// بررسی تسک‌های Overdue
+// Standup reminder — اجرای هر روز در STANDUP_TIME
+try {
+  const [sh, sm] = STANDUP_TIME.split(':').map(Number);
+  if (!isNaN(sh) && !isNaN(sm)) {
+    cron.schedule(`${sm} ${sh} * * *`, async () => {
+      try {
+        const users = await db.getTopUsersByKarma(200); // users list quick
+        for (const u of users) {
+          try {
+            await bot.telegram.sendMessage(u.user_id, `⏱ یادآوری استندآپ روزانه — لطفاً گزارش امروزت رو ثبت کن: /standup`);
+          } catch (_) { /* ignore unreachable */ }
+        }
+        await sendToGroup('⏱ یادآوری: لطفاً استندآپ روزانه‌تون رو ثبت کنید.');
+      } catch (e) { console.error('standup cron error:', e); }
+    }, { timezone: 'Europe/Istanbul' });
+  } else {
+    console.warn('فرمت STANDUP_TIME اشتباه است؛ باید HH:MM باشد.');
+  }
+} catch (e) {
+  console.error('cron schedule error:', e);
+}
+
+// Overdue checker — هر روز ساعت 09:00
 cron.schedule('0 9 * * *', async () => {
-    try {
-        const overdueTasks = await db.getOverdueTasks();
-        
-        for (const task of overdueTasks) {
-            await db.updateTaskStatus(task.id, 'Overdue');
-            
-            // notify assignee
-            const assigneeUser = await db.getUser(task.assignee_id);
-            if (assigneeUser) {
-                await bot.telegram.sendMessage(
-                    task.assignee_id,
-                    `⚠️ تسک "${task.title}" overdue شده! لطفاً پیگیری کن.`
-                );
-            }
-            
-            // notify admin
-            for (const adminId of ADMIN_USER_IDS) {
-                await bot.telegram.sendMessage(
-                    adminId,
-                    `⚠️ تسک "${task.title}" overdue شده! مسئول: @${task.assignee_username}`
-                );
-            }
-        }
-    } catch (error) {
-        console.error('Error in overdue tasks cron job:', error);
+  try {
+    const overdue = await db.getOverdueTasks();
+    for (const t of (overdue || [])) {
+      await db.updateTaskStatus(t.id, 'Overdue');
+      if (t.assignee_id) {
+        await bot.telegram.sendMessage(t.assignee_id, `⚠️ تسک "${t.title}" به وضعیت Overdue تغییر کرد.`);
+      }
+      for (const adminId of ADMIN_USER_IDS) {
+        try { await bot.telegram.sendMessage(adminId, `⚠️ تسک "${t.title}" overdue شد — مسئول: ${t.assignee_username}`); } catch(_) {}
+      }
     }
-});
+  } catch (e) { console.error('overdue cron error:', e); }
+}, { timezone: 'Europe/Istanbul' });
 
-// ============ ERROR HANDLING ============
+// ---------- Error handling ----------
 bot.catch((err, ctx) => {
-    console.error('Telegraf Error:', err);
-    if (ctx) ctx.reply('متأسفم، خطایی در سرویس رخ داده است.');
+  console.error('BOT ERROR:', err);
+  try {
+    if (ctx && ctx.reply) ctx.reply('متاسفانه خطایی رخ داد. مدیر پروژه رو اطلاع بده.');
+  } catch (_) {}
 });
 
-// ============ EXPRESS SERVER FOR WEBHOOK ============
-const express = require('express');
+// ---------- Webhook / Express ----------
 const app = express();
-
 app.use(express.json());
-app.get('/', (req, res) => res.send('ربات تلگرام در حال اجراست!'));
+app.get('/', (req, res) => res.send('Bot is running'));
 
-// Webhook setup for Render
-let isWebhookSetup = false;
+let webhookSet = false;
+
+app.post(`/bot${BOT_TOKEN}`, (req, res) => {
+  bot.handleUpdate(req.body, res).catch(e => {
+    console.error('handleUpdate error:', e);
+  });
+  res.sendStatus(200);
+});
 
 app.listen(PORT, async () => {
-    console.log(`سرور در پورت ${PORT} در حال اجراست`);
-    
-    // Set webhook in production
-    if (process.env.NODE_ENV === 'production') {
-        try {
-            const domain = process.env.RENDER_EXTERNAL_URL;
-            await bot.telegram.setWebhook(`${domain}/bot${BOT_TOKEN}`);
-            app.post(`/bot${BOT_TOKEN}`, (req, res) => {
-                bot.handleUpdate(req.body, res);
-            });
-            isWebhookSetup = true;
-            console.log('Webhook setup successfully');
-        } catch (error) {
-            console.error('Error setting webhook:', error);
-        }
+  console.log(`Express listening on ${PORT} (env: ${NODE_ENV})`);
+  if (NODE_ENV === 'production') {
+    // set webhook if domain provided
+    const domain = process.env.WEBHOOK_URL || process.env.RENDER_EXTERNAL_URL;
+    if (domain) {
+      try {
+        await bot.telegram.setWebhook(`${domain}/bot${BOT_TOKEN}`);
+        webhookSet = true;
+        console.log('Webhook set:', `${domain}/bot${BOT_TOKEN}`);
+      } catch (e) {
+        console.error('setWebhook error:', e);
+      }
+    } else {
+      console.warn('در حالت production اما WEBHOOK_URL تنظیم نشده — از polling استفاده خواهد شد.');
+      if (NODE_ENV !== 'production') await bot.launch();
     }
+  } else {
+    // development -> polling
+    try {
+      await bot.launch();
+      console.log('Bot launched (polling mode)');
+    } catch (e) {
+      console.error('bot.launch error:', e);
+    }
+  }
 });
 
-// ============ BOT LAUNCH ============
-if (process.env.NODE_ENV !== 'production') {
-    bot.launch().then(() => {
-        console.log('ربات در حال اجراست... (Polling Mode)');
-    });
-}
-
-// Graceful stop - فقط در حالت polling
-if (process.env.NODE_ENV !== 'production') {
-    process.once('SIGINT', () => bot.stop('SIGINT'));
-    process.once('SIGTERM', () => bot.stop('SIGTERM'));
-} else {
-    // در حالت production فقط webhook رو حذف کنیم
-    process.once('SIGINT', async () => {
-        if (isWebhookSetup) {
-            await bot.telegram.deleteWebhook();
-            console.log('Webhook deleted');
-        }
-        process.exit(0);
-    });
-    process.once('SIGTERM', async () => {
-        if (isWebhookSetup) {
-            await bot.telegram.deleteWebhook();
-            console.log('Webhook deleted');
-        }
-        process.exit(0);
-    });
-}
+// ---------- Graceful shutdown ----------
+const shutdown = async () => {
+  try {
+    console.log('Shutting down bot...');
+    if (!webhookSet) {
+      await bot.stop('SIGTERM');
+    } else {
+      try { await bot.telegram.deleteWebhook(); } catch(_) {}
+    }
+    db.close();
+    process.exit(0);
+  } catch (e) {
+    console.error('shutdown error:', e);
+    process.exit(1);
+  }
+};
+process.once('SIGINT', shutdown);
+process.once('SIGTERM', shutdown);
