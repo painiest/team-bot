@@ -43,17 +43,19 @@ class Database {
                 FOREIGN KEY (author_id) REFERENCES users (user_id) ON DELETE CASCADE
             )`,
 
-            // Tasks table
+            // Tasks table (با assignee_id اضافه شده)
             `CREATE TABLE IF NOT EXISTS tasks (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 title TEXT NOT NULL,
                 description TEXT,
+                assignee_id INTEGER NOT NULL,
                 assignee_username TEXT NOT NULL,
                 deadline TEXT,
                 status TEXT DEFAULT 'ToDo',
                 creator_id INTEGER NOT NULL,
                 related_idea_id INTEGER,
                 created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (assignee_id) REFERENCES users (user_id) ON DELETE CASCADE,
                 FOREIGN KEY (creator_id) REFERENCES users (user_id) ON DELETE CASCADE,
                 FOREIGN KEY (related_idea_id) REFERENCES ideas (id) ON DELETE SET NULL
             )`,
@@ -93,7 +95,7 @@ class Database {
                 FOREIGN KEY (created_by) REFERENCES users (user_id) ON DELETE CASCADE
             )`,
 
-            // Idea Votes table (برای جلوگیری از رأی تکراری)
+            // Idea Votes table
             `CREATE TABLE IF NOT EXISTS idea_votes (
                 user_id INTEGER NOT NULL,
                 idea_id INTEGER NOT NULL,
@@ -103,14 +105,14 @@ class Database {
                 FOREIGN KEY (idea_id) REFERENCES ideas (id) ON DELETE CASCADE
             )`,
 
-            // Roles table (برای مدیریت نقش‌ها)
+            // Roles table
             `CREATE TABLE IF NOT EXISTS roles (
                 user_id INTEGER PRIMARY KEY,
                 role TEXT NOT NULL DEFAULT 'member',
                 FOREIGN KEY (user_id) REFERENCES users (user_id) ON DELETE CASCADE
             )`,
 
-            // Notifications table (برای اعلان‌های هوشمند)
+            // Notifications table
             `CREATE TABLE IF NOT EXISTS notifications (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 user_id INTEGER NOT NULL,
@@ -299,14 +301,14 @@ class Database {
     }
 
     // ============ TASK METHODS ============
-    createTask(title, description, assignee, deadline, status, creatorId, relatedIdeaId = null) {
+    createTask(title, description, assigneeId, assigneeUsername, deadline, status, creatorId, relatedIdeaId = null) {
         return new Promise((resolve, reject) => {
             this.db.serialize(() => {
                 this.db.run('BEGIN TRANSACTION');
 
                 this.db.run(
-                    'INSERT INTO tasks (title, description, assignee_username, deadline, status, creator_id, related_idea_id) VALUES (?, ?, ?, ?, ?, ?, ?)',
-                    [title, description, assignee, deadline, status, creatorId, relatedIdeaId],
+                    'INSERT INTO tasks (title, description, assignee_id, assignee_username, deadline, status, creator_id, related_idea_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
+                    [title, description, assigneeId, assigneeUsername, deadline, status, creatorId, relatedIdeaId],
                     function(err) {
                         if (err) {
                             this.db.run('ROLLBACK');
@@ -356,7 +358,7 @@ class Database {
                         // If task is marked as done, add karma to assignee
                         if (newStatus.toLowerCase() === 'done') {
                             this.db.get(
-                                'SELECT assignee_username FROM tasks WHERE id = ?',
+                                'SELECT assignee_id FROM tasks WHERE id = ?',
                                 [taskId],
                                 (err, task) => {
                                     if (err) {
@@ -364,44 +366,23 @@ class Database {
                                         return reject(err);
                                     }
 
-                                    if (task && task.assignee_username) {
-                                        this.db.get(
-                                            'SELECT user_id FROM users WHERE username = ?',
-                                            [task.assignee_username],
-                                            (err, user) => {
+                                    if (task && task.assignee_id) {
+                                        this.db.run(
+                                            'UPDATE users SET karma = karma + 30 WHERE user_id = ?',
+                                            [task.assignee_id],
+                                            (err) => {
                                                 if (err) {
                                                     this.db.run('ROLLBACK');
                                                     return reject(err);
                                                 }
 
-                                                if (user) {
-                                                    this.db.run(
-                                                        'UPDATE users SET karma = karma + 30 WHERE user_id = ?',
-                                                        [user.user_id],
-                                                        (err) => {
-                                                            if (err) {
-                                                                this.db.run('ROLLBACK');
-                                                                return reject(err);
-                                                            }
-
-                                                            this.db.run('COMMIT', (err) => {
-                                                                if (err) {
-                                                                    this.db.run('ROLLBACK');
-                                                                    return reject(err);
-                                                                }
-                                                                resolve(this.changes > 0);
-                                                            });
-                                                        }
-                                                    );
-                                                } else {
-                                                    this.db.run('COMMIT', (err) => {
-                                                        if (err) {
-                                                            this.db.run('ROLLBACK');
-                                                            return reject(err);
-                                                        }
-                                                        resolve(this.changes > 0);
-                                                    });
-                                                }
+                                                this.db.run('COMMIT', (err) => {
+                                                    if (err) {
+                                                        this.db.run('ROLLBACK');
+                                                        return reject(err);
+                                                    }
+                                                    resolve(this.changes > 0);
+                                                });
                                             }
                                         );
                                     } else {
@@ -436,7 +417,7 @@ class Database {
                 `SELECT tasks.*, 
                  (SELECT username FROM users WHERE user_id = tasks.creator_id) as creator_username
                  FROM tasks 
-                 WHERE assignee_username = COALESCE((SELECT username FROM users WHERE user_id = ?), '') 
+                 WHERE assignee_id = ?
                  ORDER BY created_at DESC`,
                 [userId],
                 (err, rows) => {
@@ -450,9 +431,7 @@ class Database {
     getOverdueTasks() {
         return new Promise((resolve, reject) => {
             this.db.all(
-                `SELECT tasks.*, users.user_id as assignee_id
-                 FROM tasks 
-                 LEFT JOIN users ON tasks.assignee_username = users.username
+                `SELECT * FROM tasks 
                  WHERE deadline < date('now') AND status NOT IN ('Done', 'Overdue')`,
                 (err, rows) => {
                     if (err) reject(err);
@@ -764,15 +743,6 @@ class Database {
     getUserByUsername(username) {
         return new Promise((resolve, reject) => {
             this.db.get('SELECT * FROM users WHERE username = ?', [username], (err, row) => {
-                if (err) reject(err);
-                else resolve(row);
-            });
-        });
-    }
-
-    getUser(userId) {
-        return new Promise((resolve, reject) => {
-            this.db.get('SELECT * FROM users WHERE user_id = ?', [userId], (err, row) => {
                 if (err) reject(err);
                 else resolve(row);
             });

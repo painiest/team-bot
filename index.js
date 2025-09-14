@@ -128,13 +128,32 @@ const taskWizard = new Scenes.WizardScene(
         return ctx.wizard.next();
     },
     async (ctx) => {
-        let assigneeUsername = ctx.message.text.replace('@', '');
-        if (assigneeUsername === 'خودم') {
-            assigneeUsername = ctx.from.username || '';
+        try {
+            let assigneeUsername = ctx.message.text.replace('@', '').trim();
+            let assigneeId = null;
+
+            if (assigneeUsername === 'خودم') {
+                assigneeId = ctx.from.id;
+                assigneeUsername = ctx.from.username || ctx.from.first_name;
+            } else {
+                const user = await db.getUserByUsername(assigneeUsername);
+                if (!user) {
+                    await ctx.reply('کاربر مورد نظر یافت نشد! لطفاً username صحیح وارد کنید:');
+                    return;
+                }
+                assigneeId = user.user_id;
+            }
+
+            ctx.session.task.assigneeId = assigneeId;
+            ctx.session.task.assigneeUsername = assigneeUsername;
+            
+            await ctx.reply('Deadline رو وارد کن (YYYY-MM-DD):', Markup.forceReply());
+            return ctx.wizard.next();
+        } catch (error) {
+            console.error('Error finding user:', error);
+            await ctx.reply('خطا در یافتن کاربر. لطفاً دوباره تلاش کنید.');
+            return ctx.scene.leave();
         }
-        ctx.session.task.assignee = assigneeUsername;
-        await ctx.reply('Deadline رو وارد کن (YYYY-MM-DD):', Markup.forceReply());
-        return ctx.wizard.next();
     },
     async (ctx) => {
         const deadline = ctx.message.text;
@@ -147,7 +166,8 @@ const taskWizard = new Scenes.WizardScene(
             const taskId = await db.createTask(
                 ctx.session.task.title,
                 ctx.session.task.description,
-                ctx.session.task.assignee,
+                ctx.session.task.assigneeId,
+                ctx.session.task.assigneeUsername,
                 deadline,
                 'ToDo',
                 ctx.from.id
@@ -159,10 +179,9 @@ const taskWizard = new Scenes.WizardScene(
             );
 
             // Notify assignee
-            const assigneeUser = await db.getUserByUsername(ctx.session.task.assignee);
-            if (assigneeUser && assigneeUser.user_id !== ctx.from.id) {
+            if (ctx.session.task.assigneeId !== ctx.from.id) {
                 await bot.telegram.sendMessage(
-                    assigneeUser.user_id,
+                    ctx.session.task.assigneeId,
                     `🎯 تسک جدید برات assign شد:\n\n${ctx.session.task.title}\nمهلت: ${deadline}\n\nوضعیت: ToDo`,
                     Markup.inlineKeyboard([
                         [Markup.button.callback('▶️ شروع', `task_start_${taskId}`)],
@@ -177,7 +196,7 @@ const taskWizard = new Scenes.WizardScene(
 
 عنوان: ${ctx.session.task.title}
 توضیحات: ${ctx.session.task.description}
-مسئول: @${ctx.session.task.assignee}
+مسئول: @${ctx.session.task.assigneeUsername}
 مهلت: ${deadline}
 وضعیت: ToDo
 ثبت شده توسط: @${ctx.from.username || ctx.from.first_name}
@@ -320,15 +339,16 @@ bot.use(stage.middleware());
 
 // START COMMAND
 bot.start(async (ctx) => {
-    // ابتدا کاربر رو ایجاد یا آپدیت کن
-    await db.createUser(ctx.from.id, ctx.from.username || ctx.from.first_name);
-    
-    // بررسی کن آیا کاربر قبلاً قوانین رو پذیرفته
-    const user = await db.getUser(ctx.from.id);
-    
-    if (user && user.accepted_rules) {
-        // کاربر قبلاً قوانین رو پذیرفته
-        const welcomeMessage = `
+    try {
+        // ابتدا کاربر رو ایجاد یا آپدیت کن
+        await db.createUser(ctx.from.id, ctx.from.username || ctx.from.first_name);
+        
+        // بررسی کن آیا کاربر قبلاً قوانین رو پذیرفته
+        const user = await db.getUser(ctx.from.id);
+        
+        if (user && user.accepted_rules) {
+            // کاربر قبلاً قوانین رو پذیرفته
+            const welcomeMessage = `
 سلام ${ctx.from.first_name}! 👋
 به ربات مدیریت تیم خوش اومدی!
 
@@ -344,12 +364,12 @@ bot.start(async (ctx) => {
 👥 /members - مدیریت اعضا (ادمین)
 
 برای شروع /help رو بزن.
-        `.trim();
+            `.trim();
 
-        await ctx.reply(welcomeMessage);
-    } else {
-        // کاربر هنوز قوانین رو نپذیرفته
-        const welcomeMessage = `
+            await ctx.reply(welcomeMessage);
+        } else {
+            // کاربر هنوز قوانین رو نپذیرفته
+            const welcomeMessage = `
 سلام ${ctx.from.first_name}! 👋
 به ربات مدیریت تیم خوش اومدی!
 
@@ -358,12 +378,12 @@ bot.start(async (ctx) => {
 🏆 /karma - امتیاز من
 🎯 /task - ساخت تسک جدید
 📋 /mytasks - تسک‌های من
-        `.trim();
+            `.trim();
 
-        await ctx.reply(welcomeMessage);
+            await ctx.reply(welcomeMessage);
 
-        // Send rules and ask for acceptance
-        const rulesMessage = `
+            // Send rules and ask for acceptance
+            const rulesMessage = `
 📋 قوانین تیم:
 
 1. احترام متقابل به همه اعضا
@@ -372,12 +392,16 @@ bot.start(async (ctx) => {
 4. مشارکت در بحث‌های تیمی
 
 آیا قوانین رو می‌پذیری؟
-        `.trim();
+            `.trim();
 
-        await ctx.reply(rulesMessage, Markup.inlineKeyboard([
-            Markup.button.callback('✅ قبول می‌کنم', 'accept_rules'),
-            Markup.button.callback('❌ نمی‌پذیرم', 'reject_rules')
-        ]));
+            await ctx.reply(rulesMessage, Markup.inlineKeyboard([
+                Markup.button.callback('✅ قبول می‌کنم', 'accept_rules'),
+                Markup.button.callback('❌ نمی‌پذیرم', 'reject_rules')
+            ]));
+        }
+    } catch (error) {
+        console.error('Error in start command:', error);
+        await ctx.reply('خطایی در پردازش درخواست شما رخ داده است.');
     }
 });
 
@@ -608,9 +632,14 @@ bot.on('inline_query', async (ctx) => {
 
 // ============ CALLBACK QUERY HANDLERS ============
 bot.action(/accept_rules/, async (ctx) => {
-    await db.acceptRules(ctx.from.id);
-    await ctx.editMessageText('✅ قوانین را پذیرفتی! خوش اومدی به تیم!');
-    await ctx.answerCbQuery();
+    try {
+        await db.acceptRules(ctx.from.id);
+        await ctx.editMessageText('✅ قوانین را پذیرفتی! خوش اومدی به تیم!');
+        await ctx.answerCbQuery();
+    } catch (error) {
+        console.error('Error accepting rules:', error);
+        await ctx.answerCbQuery('خطا در پذیرش قوانین');
+    }
 });
 
 bot.action(/reject_rules/, async (ctx) => {
@@ -619,43 +648,58 @@ bot.action(/reject_rules/, async (ctx) => {
 });
 
 bot.action(/vote_idea_(\d+)/, async (ctx) => {
-    const ideaId = ctx.match[1];
-    const voted = await db.voteForIdea(ctx.from.id, ideaId);
-    
-    if (voted) {
-        await ctx.answerCbQuery('👍 رأی تو ثبت شد!');
-        await ctx.editMessageText(
-            ctx.update.callback_query.message.text + `\n\n✅ @${ctx.from.username} رأی داد`,
-            ctx.update.callback_query.message.reply_markup
-        );
-    } else {
-        await ctx.answerCbQuery('❌ قبلاً به این ایده رأی دادی!');
+    try {
+        const ideaId = ctx.match[1];
+        const voted = await db.voteForIdea(ctx.from.id, ideaId);
+        
+        if (voted) {
+            await ctx.answerCbQuery('👍 رأی تو ثبت شد!');
+            await ctx.editMessageText(
+                ctx.update.callback_query.message.text + `\n\n✅ @${ctx.from.username} رأی داد`,
+                ctx.update.callback_query.message.reply_markup
+            );
+        } else {
+            await ctx.answerCbQuery('❌ قبلاً به این ایده رأی دادی!');
+        }
+    } catch (error) {
+        console.error('Error voting for idea:', error);
+        await ctx.answerCbQuery('خطا در ثبت رأی');
     }
 });
 
 bot.action(/task_start_(\d+)/, async (ctx) => {
-    const taskId = ctx.match[1];
-    const updated = await db.updateTaskStatus(taskId, 'In Progress');
-    
-    if (updated) {
-        await ctx.answerCbQuery('✅ تسک شروع شد!');
-        await ctx.editMessageText(
-            ctx.update.callback_query.message.text.replace('وضعیت: ToDo', 'وضعیت: In Progress'),
-            ctx.update.callback_query.message.reply_markup
-        );
+    try {
+        const taskId = ctx.match[1];
+        const updated = await db.updateTaskStatus(taskId, 'In Progress');
+        
+        if (updated) {
+            await ctx.answerCbQuery('✅ تسک شروع شد!');
+            await ctx.editMessageText(
+                ctx.update.callback_query.message.text.replace('وضعیت: ToDo', 'وضعیت: In Progress'),
+                ctx.update.callback_query.message.reply_markup
+            );
+        }
+    } catch (error) {
+        console.error('Error starting task:', error);
+        await ctx.answerCbQuery('خطا در شروع تسک');
     }
 });
 
 bot.action(/task_done_(\d+)/, async (ctx) => {
-    const taskId = ctx.match[1];
-    const updated = await db.updateTaskStatus(taskId, 'Done');
-    
-    if (updated) {
-        await ctx.answerCbQuery('🎉 تسک انجام شد! 30 امتیاز کارما گرفتی!');
-        await ctx.editMessageText(
-            ctx.update.callback_query.message.text.replace('وضعیت: ToDo', 'وضعیت: Done ✅'),
-            ctx.update.callback_query.message.reply_markup
-        );
+    try {
+        const taskId = ctx.match[1];
+        const updated = await db.updateTaskStatus(taskId, 'Done');
+        
+        if (updated) {
+            await ctx.answerCbQuery('🎉 تسک انجام شد! 30 امتیاز کارما گرفتی!');
+            await ctx.editMessageText(
+                ctx.update.callback_query.message.text.replace('وضعیت: ToDo', 'وضعیت: Done ✅'),
+                ctx.update.callback_query.message.reply_markup
+            );
+        }
+    } catch (error) {
+        console.error('Error completing task:', error);
+        await ctx.answerCbQuery('خطا در تکمیل تسک');
     }
 });
 
@@ -687,10 +731,13 @@ cron.schedule('0 9 * * *', async () => {
             await db.updateTaskStatus(task.id, 'Overdue');
             
             // notify assignee
-            await bot.telegram.sendMessage(
-                task.assignee_id,
-                `⚠️ تسک "${task.title}" overdue شده! لطفاً پیگیری کن.`
-            );
+            const assigneeUser = await db.getUser(task.assignee_id);
+            if (assigneeUser) {
+                await bot.telegram.sendMessage(
+                    task.assignee_id,
+                    `⚠️ تسک "${task.title}" overdue شده! لطفاً پیگیری کن.`
+                );
+            }
             
             // notify admin
             for (const adminId of ADMIN_USER_IDS) {
