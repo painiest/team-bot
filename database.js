@@ -32,8 +32,23 @@ class Database {
             )
         `;
 
+        const tasksTable = `
+            CREATE TABLE IF NOT EXISTS tasks (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                title TEXT NOT NULL,
+                description TEXT,
+                assignee_username TEXT NOT NULL,
+                deadline TEXT,
+                status TEXT DEFAULT 'ToDo',
+                creator_id INTEGER NOT NULL,
+                created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (creator_id) REFERENCES users (user_id)
+            )
+        `;
+
         this.db.run(usersTable);
         this.db.run(ideasTable);
+        this.db.run(tasksTable);
     }
 
     getUser(userId) {
@@ -109,6 +124,56 @@ class Database {
                 (err, rows) => {
                     if (err) reject(err);
                     else resolve(rows);
+                }
+            );
+        });
+    }
+
+    getUserByUsername(username) {
+        return new Promise((resolve, reject) => {
+            this.db.get('SELECT * FROM users WHERE username = ?', [username], (err, row) => {
+                if (err) reject(err);
+                else resolve(row);
+            });
+        });
+    }
+
+    createTask(title, description, assignee, deadline, status, creatorId) {
+        return new Promise((resolve, reject) => {
+            this.db.run(
+                'INSERT INTO tasks (title, description, assignee_username, deadline, status, creator_id) VALUES (?, ?, ?, ?, ?, ?)',
+                [title, description, assignee, deadline, status, creatorId],
+                function(err) {
+                    if (err) reject(err);
+                    else resolve(this.lastID);
+                }.bind(this)
+            );
+        });
+    }
+
+    getUserTasks(userId) {
+        return new Promise((resolve, reject) => {
+            this.db.all(
+                `SELECT * FROM tasks 
+                 WHERE assignee_username = (SELECT username FROM users WHERE user_id = ?) 
+                 ORDER BY created_at DESC`,
+                [userId],
+                (err, rows) => {
+                    if (err) reject(err);
+                    else resolve(rows);
+                }
+            );
+        });
+    }
+
+    addKarma(userId, amount) {
+        return new Promise((resolve, reject) => {
+            this.db.run(
+                'UPDATE users SET karma = karma + ? WHERE user_id = ?',
+                [amount, userId],
+                (err) => {
+                    if (err) reject(err);
+                    else resolve();
                 }
             );
         });
