@@ -1,7 +1,10 @@
-// index.js - بازنویسی‌شده
 require('dotenv').config();
-const { Telegraf, Markup, session } = require('telegraf');
-const { Scenes, Composer, Stage, WizardScene } = require('telegraf');
+
+// درست: Scenes رو بگیر و از داخلش WizardScene و Stage رو استخراج کن
+const { Telegraf, Markup, session, Composer } = require('telegraf');
+const { Scenes } = require('telegraf');    // Scenes یک آبجکت است
+const { WizardScene, Stage } = Scenes;     // از داخل Scenes استخراج می‌کنیم
+
 const cron = require('node-cron');
 const express = require('express');
 const Database = require('./database'); // نسخه‌ای که قبلاً بازنویسی شد
